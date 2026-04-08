@@ -1,0 +1,900 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>sox monitor</title>
+<style>
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+:root {
+  --bg-primary: #0f172a;
+  --bg-secondary: #1e293b;
+  --bg-card: rgba(30, 41, 59, 0.7);
+  --border: rgba(71, 85, 105, 0.4);
+  --text-primary: #f1f5f9;
+  --text-secondary: #94a3b8;
+  --text-muted: #64748b;
+  --blue: #3b82f6;
+  --blue-glow: rgba(59, 130, 246, 0.15);
+  --green: #22c55e;
+  --green-glow: rgba(34, 197, 94, 0.15);
+  --purple: #a855f7;
+  --purple-glow: rgba(168, 85, 247, 0.15);
+  --amber: #f59e0b;
+  --amber-glow: rgba(245, 158, 11, 0.15);
+  --red: #ef4444;
+  --red-glow: rgba(239, 68, 68, 0.15);
+  --cyan: #06b6d4;
+}
+
+body {
+  background: linear-gradient(135deg, #0f172a, #1e293b);
+  color: var(--text-primary);
+  font-family: 'SF Mono', 'Cascadia Code', Consolas, 'Liberation Mono', monospace;
+  min-height: 100vh;
+  padding: 24px;
+  line-height: 1.5;
+}
+
+.container { max-width: 1400px; margin: 0 auto; }
+
+/* Header */
+.header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 16px 24px;
+  margin-bottom: 24px;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  backdrop-filter: blur(12px);
+}
+
+.header-left { display: flex; align-items: center; gap: 16px; }
+
+.logo {
+  font-size: 22px;
+  font-weight: 700;
+  letter-spacing: -0.5px;
+  color: var(--text-primary);
+}
+
+.logo span { color: var(--cyan); }
+
+.mode-badge {
+  padding: 4px 12px;
+  border-radius: 6px;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  background: rgba(6, 182, 212, 0.15);
+  color: var(--cyan);
+  border: 1px solid rgba(6, 182, 212, 0.3);
+}
+
+.header-right { display: flex; align-items: center; gap: 12px; }
+
+.health-status { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--text-secondary); }
+
+.health-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--green);
+  position: relative;
+}
+
+.health-dot::after {
+  content: '';
+  position: absolute;
+  inset: -3px;
+  border-radius: 50%;
+  background: rgba(34, 197, 94, 0.4);
+  animation: pulse 2s ease-in-out infinite;
+}
+
+.health-dot.disconnected { background: var(--red); }
+.health-dot.disconnected::after { background: rgba(239, 68, 68, 0.4); }
+
+@keyframes pulse {
+  0%, 100% { transform: scale(1); opacity: 1; }
+  50% { transform: scale(1.8); opacity: 0; }
+}
+
+/* Cards */
+.cards-row {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 16px;
+  margin-bottom: 24px;
+}
+
+.card {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 24px;
+  backdrop-filter: blur(12px);
+  transition: border-color 0.3s;
+}
+
+.card:hover { border-color: rgba(148, 163, 184, 0.3); }
+
+.card-label {
+  font-size: 13px;
+  text-transform: uppercase;
+  letter-spacing: 1.5px;
+  color: var(--text-muted);
+  margin-bottom: 8px;
+}
+
+.card-value {
+  font-size: 42px;
+  font-weight: 700;
+  line-height: 1.1;
+  margin-bottom: 6px;
+}
+
+.card-value.blue { color: var(--blue); }
+.card-value.green { color: var(--green); }
+.card-value.purple { color: var(--purple); }
+.card-value.amber { color: var(--amber); }
+
+.card-sub { font-size: 13px; color: var(--text-secondary); }
+
+.card-glow-blue { box-shadow: inset 0 1px 0 0 rgba(59, 130, 246, 0.1); }
+.card-glow-green { box-shadow: inset 0 1px 0 0 rgba(34, 197, 94, 0.1); }
+.card-glow-purple { box-shadow: inset 0 1px 0 0 rgba(168, 85, 247, 0.1); }
+.card-glow-amber { box-shadow: inset 0 1px 0 0 rgba(245, 158, 11, 0.1); }
+
+/* Two-column rows */
+.two-col {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 16px;
+  margin-bottom: 24px;
+}
+
+.panel {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 24px;
+  backdrop-filter: blur(12px);
+}
+
+.panel-title {
+  font-size: 13px;
+  text-transform: uppercase;
+  letter-spacing: 1.5px;
+  color: var(--text-muted);
+  margin-bottom: 16px;
+}
+
+/* Chart controls */
+.chart-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 16px;
+}
+
+.time-slots { display: flex; gap: 6px; }
+
+.time-btn {
+  padding: 4px 12px;
+  border-radius: 6px;
+  font-size: 12px;
+  font-family: inherit;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.time-btn:hover { border-color: var(--blue); color: var(--blue); }
+.time-btn.active { background: rgba(59, 130, 246, 0.15); border-color: var(--blue); color: var(--blue); }
+
+.chart-legend { display: flex; gap: 16px; font-size: 12px; color: var(--text-secondary); }
+.chart-legend span { display: flex; align-items: center; gap: 6px; }
+.legend-line { width: 20px; height: 2px; border-radius: 1px; }
+.legend-line.tx { background: var(--blue); }
+.legend-line.rx { background: var(--green); }
+
+.chart-container {
+  width: 100%;
+  height: 200px;
+  position: relative;
+}
+
+.chart-container svg { width: 100%; height: 100%; }
+
+/* Topology */
+.topology-container {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0;
+  padding: 20px 8px;
+  min-height: 120px;
+}
+
+.topo-node {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+}
+
+.topo-box {
+  padding: 10px 18px;
+  border-radius: 10px;
+  border: 1px solid;
+  text-align: center;
+  min-width: 80px;
+}
+
+.topo-box .topo-val { font-size: 18px; font-weight: 700; line-height: 1.2; }
+.topo-box .topo-sub { font-size: 10px; opacity: 0.7; margin-top: 2px; }
+
+.topo-box.blue { border-color: var(--blue); color: var(--blue); background: var(--blue-glow); }
+.topo-box.amber { border-color: var(--amber); color: var(--amber); background: var(--amber-glow); }
+.topo-box.green { border-color: var(--green); color: var(--green); background: var(--green-glow); }
+.topo-box.purple { border-color: var(--purple); color: var(--purple); background: var(--purple-glow); }
+.topo-box.red { border-color: var(--red); color: var(--red); background: var(--red-glow); }
+
+.topo-label { font-size: 12px; color: var(--text-secondary); text-align: center; font-weight: 600; }
+.topo-count { font-size: 11px; color: var(--text-muted); }
+
+.topo-arrow {
+  display: flex;
+  align-items: center;
+  gap: 0;
+  padding: 0 4px;
+  margin-bottom: 28px;
+}
+
+.topo-arrow-line {
+  width: 40px;
+  height: 0;
+  border-top: 1.5px dashed var(--text-muted);
+}
+
+.topo-arrow-head {
+  width: 0; height: 0;
+  border-top: 5px solid transparent;
+  border-bottom: 5px solid transparent;
+  border-left: 7px solid var(--text-muted);
+}
+
+.topo-arrow-label {
+  font-size: 9px;
+  color: var(--text-muted);
+  white-space: nowrap;
+  letter-spacing: 0.5px;
+  position: absolute;
+  margin-top: 28px;
+}
+
+.topo-arrow { position: relative; }
+
+/* Error badges */
+.error-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+}
+
+.error-badge {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 14px 16px;
+  border-radius: 8px;
+  border: 1px solid;
+}
+
+.error-badge.err-conn { background: rgba(239, 68, 68, 0.08); border-color: rgba(239, 68, 68, 0.2); }
+.error-badge.err-dns { background: rgba(245, 158, 11, 0.08); border-color: rgba(245, 158, 11, 0.2); }
+.error-badge.err-auth { background: rgba(168, 85, 247, 0.08); border-color: rgba(168, 85, 247, 0.2); }
+.error-badge.err-relay { background: rgba(59, 130, 246, 0.08); border-color: rgba(59, 130, 246, 0.2); }
+
+.error-badge-label { font-size: 13px; color: var(--text-secondary); }
+.error-badge-value { font-size: 20px; font-weight: 700; }
+
+.err-conn .error-badge-value { color: var(--red); }
+.err-dns .error-badge-value { color: var(--amber); }
+.err-auth .error-badge-value { color: var(--purple); }
+.err-relay .error-badge-value { color: var(--blue); }
+
+/* Connection rate & top IPs */
+.rate-section { margin-bottom: 24px; }
+
+.rate-value {
+  font-size: 42px;
+  font-weight: 700;
+  color: var(--cyan);
+  line-height: 1.1;
+}
+
+.rate-label { font-size: 13px; color: var(--text-secondary); margin-top: 4px; }
+
+.top-ips-title {
+  font-size: 13px;
+  text-transform: uppercase;
+  letter-spacing: 1.5px;
+  color: var(--text-muted);
+  margin-bottom: 12px;
+  padding-top: 16px;
+  border-top: 1px solid var(--border);
+}
+
+.ip-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 0;
+  border-bottom: 1px solid rgba(71, 85, 105, 0.2);
+  font-size: 13px;
+}
+
+.ip-addr { color: var(--text-primary); }
+.ip-count { color: var(--text-muted); }
+
+/* Clients table */
+.full-width { margin-bottom: 24px; }
+
+.clients-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 14px;
+}
+
+.clients-table th {
+  text-align: left;
+  padding: 12px 16px;
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  color: var(--text-muted);
+  border-bottom: 1px solid var(--border);
+  font-weight: 600;
+}
+
+.clients-table td {
+  padding: 14px 16px;
+  border-bottom: 1px solid rgba(71, 85, 105, 0.2);
+  color: var(--text-secondary);
+}
+
+.clients-table tr:hover td { background: rgba(255, 255, 255, 0.02); }
+
+.status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  display: inline-block;
+}
+
+.status-dot.online { background: var(--green); }
+.status-dot.offline { background: var(--red); }
+
+.client-id { font-weight: 600; color: var(--text-primary); }
+
+.pool-bar-container {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.pool-bar {
+  width: 80px;
+  height: 6px;
+  background: rgba(71, 85, 105, 0.3);
+  border-radius: 3px;
+  overflow: hidden;
+}
+
+.pool-bar-fill {
+  height: 100%;
+  border-radius: 3px;
+  background: var(--green);
+  transition: width 0.5s ease;
+}
+
+.pool-bar-fill.warning { background: var(--amber); }
+
+.pool-text { font-size: 13px; color: var(--text-secondary); white-space: nowrap; }
+
+.no-clients {
+  text-align: center;
+  padding: 40px;
+  color: var(--text-muted);
+  font-size: 14px;
+}
+
+/* Footer */
+.footer {
+  text-align: center;
+  padding: 20px;
+  font-size: 12px;
+  color: var(--text-muted);
+  border-top: 1px solid var(--border);
+}
+
+.footer span { margin: 0 12px; }
+
+/* Responsive */
+@media (max-width: 1024px) {
+  .cards-row { grid-template-columns: repeat(2, 1fr); }
+  .two-col { grid-template-columns: 1fr; }
+}
+
+@media (max-width: 640px) {
+  body { padding: 12px; }
+  .cards-row { grid-template-columns: 1fr; }
+  .card-value { font-size: 32px; }
+  .header { flex-direction: column; gap: 12px; }
+}
+</style>
+</head>
+<body>
+<div class="container">
+
+  <!-- Header -->
+  <header class="header">
+    <div class="header-left">
+      <div class="logo">sox <span>monitor</span></div>
+      <div class="mode-badge" id="modeBadge">---</div>
+    </div>
+    <div class="header-right">
+      <div class="health-status">
+        <div class="health-dot" id="healthDot"></div>
+        <span id="healthText">connecting...</span>
+      </div>
+    </div>
+  </header>
+
+  <!-- Status Cards -->
+  <div class="cards-row">
+    <div class="card card-glow-blue">
+      <div class="card-label">Active Connections</div>
+      <div class="card-value blue" id="activeConns">--</div>
+      <div class="card-sub">peak <span id="peakConns">--</span> / total <span id="totalConns">--</span></div>
+    </div>
+    <div class="card card-glow-green">
+      <div class="card-label">Throughput</div>
+      <div class="card-value green" id="throughput">--</div>
+      <div class="card-sub">TX <span id="txRate">--</span> / RX <span id="rxRate">--</span></div>
+    </div>
+    <div class="card card-glow-purple" id="cardTunnelClients">
+      <div class="card-label">Tunnel Clients</div>
+      <div class="card-value purple" id="clientCount">--</div>
+      <div class="card-sub"><span id="clientOnline">--</span> online</div>
+    </div>
+    <div class="card card-glow-amber">
+      <div class="card-label">Uptime</div>
+      <div class="card-value amber" id="uptime">--</div>
+      <div class="card-sub">listen <span id="listenAddr">--</span></div>
+    </div>
+  </div>
+
+  <!-- Chart + Topology -->
+  <div class="two-col">
+    <div class="panel">
+      <div class="chart-header">
+        <div class="panel-title" style="margin-bottom:0">Traffic</div>
+        <div style="display:flex;align-items:center;gap:16px">
+          <div class="chart-legend">
+            <span><span class="legend-line tx"></span>TX (upload)</span>
+            <span><span class="legend-line rx"></span>RX (download)</span>
+          </div>
+          <div class="time-slots">
+            <button class="time-btn active" data-window="300">5m</button>
+            <button class="time-btn" data-window="900">15m</button>
+            <button class="time-btn" data-window="1800">30m</button>
+            <button class="time-btn" data-window="3600">1h</button>
+          </div>
+        </div>
+      </div>
+      <div class="chart-container" id="chartContainer">
+        <svg id="trafficChart" viewBox="0 0 600 200" preserveAspectRatio="none">
+          <defs>
+            <linearGradient id="txGrad" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0%" stop-color="rgba(59,130,246,0.3)"/>
+              <stop offset="100%" stop-color="rgba(59,130,246,0)"/>
+            </linearGradient>
+            <linearGradient id="rxGrad" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0%" stop-color="rgba(34,197,94,0.3)"/>
+              <stop offset="100%" stop-color="rgba(34,197,94,0)"/>
+            </linearGradient>
+          </defs>
+          <!-- Grid lines -->
+          <line x1="0" y1="50" x2="600" y2="50" stroke="rgba(71,85,105,0.15)" stroke-width="1"/>
+          <line x1="0" y1="100" x2="600" y2="100" stroke="rgba(71,85,105,0.15)" stroke-width="1"/>
+          <line x1="0" y1="150" x2="600" y2="150" stroke="rgba(71,85,105,0.15)" stroke-width="1"/>
+          <!-- TX fill + line -->
+          <path id="txFill" d="" fill="url(#txGrad)"/>
+          <polyline id="txLine" fill="none" stroke="#3b82f6" stroke-width="2" stroke-linejoin="round"/>
+          <!-- RX fill + line -->
+          <path id="rxFill" d="" fill="url(#rxGrad)"/>
+          <polyline id="rxLine" fill="none" stroke="#22c55e" stroke-width="2" stroke-linejoin="round" stroke-dasharray="6,3"/>
+          <!-- Y-axis labels -->
+          <text id="yMax" x="4" y="14" fill="#64748b" font-size="10" font-family="monospace">--</text>
+          <text id="yMid" x="4" y="104" fill="#64748b" font-size="10" font-family="monospace">--</text>
+          <text id="yZero" x="4" y="196" fill="#64748b" font-size="10" font-family="monospace">0</text>
+        </svg>
+      </div>
+    </div>
+    <div class="panel">
+      <div class="panel-title">Architecture</div>
+      <div class="topology-container" id="topologyContainer">
+        <!-- Dynamically rendered based on server mode -->
+      </div>
+    </div>
+  </div>
+
+  <!-- Errors + Rate/IPs -->
+  <div class="two-col">
+    <div class="panel">
+      <div class="panel-title">Error Statistics</div>
+      <div class="error-grid">
+        <div class="error-badge err-conn">
+          <span class="error-badge-label">Connection Failed</span>
+          <span class="error-badge-value" id="errConn">0</span>
+        </div>
+        <div class="error-badge err-dns">
+          <span class="error-badge-label">DNS Timeout</span>
+          <span class="error-badge-value" id="errDns">0</span>
+        </div>
+        <div class="error-badge err-auth" id="badgeAuthRejected">
+          <span class="error-badge-label">Auth Rejected</span>
+          <span class="error-badge-value" id="errAuth">0</span>
+        </div>
+        <div class="error-badge err-relay">
+          <span class="error-badge-label">Relay Error</span>
+          <span class="error-badge-value" id="errRelay">0</span>
+        </div>
+      </div>
+    </div>
+    <div class="panel">
+      <div class="panel-title">Connection Rate</div>
+      <div class="rate-section">
+        <div class="rate-value" id="connRate">--</div>
+        <div class="rate-label">connections / sec</div>
+      </div>
+      <div class="top-ips-title">Top IPs</div>
+      <div id="topIpsList">
+        <div class="no-clients">No data</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Tunnel Clients Table (hidden in standalone mode) -->
+  <div class="panel full-width" id="clientsPanel">
+    <div class="panel-title">Tunnel Clients</div>
+    <table class="clients-table">
+      <thead>
+        <tr>
+          <th>Status</th>
+          <th>Client ID</th>
+          <th>Pool</th>
+          <th>TX (total)</th>
+          <th>RX (total)</th>
+          <th>Requests</th>
+          <th>Uptime</th>
+        </tr>
+      </thead>
+      <tbody id="clientsBody">
+        <tr><td colspan="7" class="no-clients">Connecting...</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <!-- Footer -->
+  <footer class="footer">
+    <span id="footerVersion">sox v--</span>
+    <span>API: /api/status</span>
+    <span>Refresh: 3s</span>
+  </footer>
+
+</div>
+
+<script>
+(function() {
+  'use strict';
+
+  let currentWindow = 300;
+
+  // --- Formatters ---
+  function fmtBytes(b) {
+    if (b == null) return '--';
+    if (b < 1024) return b + ' B';
+    if (b < 1048576) return (b / 1024).toFixed(1) + ' KB';
+    if (b < 1073741824) return (b / 1048576).toFixed(1) + ' MB';
+    return (b / 1073741824).toFixed(2) + ' GB';
+  }
+
+  function fmtRate(bps) {
+    if (bps == null) return '--';
+    // Convert bytes/s to bits/s then display as Mbps
+    var bits = bps * 8;
+    if (bits < 1000) return bits.toFixed(0) + ' bps';
+    if (bits < 1000000) return (bits / 1000).toFixed(1) + ' Kbps';
+    if (bits < 1000000000) return (bits / 1000000).toFixed(2) + ' Mbps';
+    return (bits / 1000000000).toFixed(2) + ' Gbps';
+  }
+
+  function fmtUptime(secs) {
+    if (secs == null) return '--';
+    var d = Math.floor(secs / 86400);
+    var h = Math.floor((secs % 86400) / 3600);
+    var m = Math.floor((secs % 3600) / 60);
+    var parts = [];
+    if (d > 0) parts.push(d + 'd');
+    if (h > 0 || d > 0) parts.push(h + 'h');
+    parts.push(m + 'm');
+    return parts.join(' ');
+  }
+
+  function fmtNumber(n) {
+    if (n == null) return '--';
+    return n.toLocaleString();
+  }
+
+  // --- Chart drawing ---
+  function drawChart(txData, rxData) {
+    var svgW = 600, svgH = 200;
+    var pad = 5;
+    var all = (txData || []).concat(rxData || []);
+    var maxVal = Math.max.apply(null, all.length ? all : [0]) || 1;
+
+    document.getElementById('yMax').textContent = fmtRate(maxVal);
+    document.getElementById('yMid').textContent = fmtRate(maxVal / 2);
+
+    function buildPoints(data) {
+      if (!data || data.length === 0) return '';
+      var step = (svgW - pad * 2) / Math.max(data.length - 1, 1);
+      return data.map(function(v, i) {
+        var x = pad + i * step;
+        var y = svgH - pad - ((v / maxVal) * (svgH - pad * 2));
+        return x.toFixed(1) + ',' + y.toFixed(1);
+      }).join(' ');
+    }
+
+    function buildFill(data) {
+      if (!data || data.length === 0) return '';
+      var step = (svgW - pad * 2) / Math.max(data.length - 1, 1);
+      var pts = data.map(function(v, i) {
+        var x = pad + i * step;
+        var y = svgH - pad - ((v / maxVal) * (svgH - pad * 2));
+        return x.toFixed(1) + ',' + y.toFixed(1);
+      });
+      var lastX = (pad + (data.length - 1) * step).toFixed(1);
+      var firstX = pad.toFixed(1);
+      var bottom = (svgH - pad).toFixed(1);
+      return 'M' + firstX + ',' + bottom + ' L' + pts.join(' L') + ' L' + lastX + ',' + bottom + ' Z';
+    }
+
+    document.getElementById('txLine').setAttribute('points', buildPoints(txData));
+    document.getElementById('txFill').setAttribute('d', buildFill(txData));
+    document.getElementById('rxLine').setAttribute('points', buildPoints(rxData));
+    document.getElementById('rxFill').setAttribute('d', buildFill(rxData));
+  }
+
+  // --- DOM updaters ---
+  function setConnected(ok) {
+    var dot = document.getElementById('healthDot');
+    var txt = document.getElementById('healthText');
+    if (ok) {
+      dot.className = 'health-dot';
+      txt.textContent = 'connected';
+    } else {
+      dot.className = 'health-dot disconnected';
+      txt.textContent = 'disconnected';
+    }
+  }
+
+  function updateDashboard(d) {
+    // Header
+    var mode = (d.server && d.server.mode) || 'unknown';
+    var badge = document.getElementById('modeBadge');
+    badge.textContent = mode === 'server' ? 'SERVER MODE' : mode === 'standalone' ? 'STANDALONE' : mode.toUpperCase();
+
+    // Hide/show tunnel clients panel based on mode
+    var clientsPanel = document.getElementById('clientsPanel');
+    if (clientsPanel) {
+      clientsPanel.style.display = mode === 'standalone' ? 'none' : '';
+    }
+
+    // Dim irrelevant elements based on mode and auth
+    var isStandalone = mode === 'standalone';
+    var hasAuth = d.server && d.server.auth_enabled;
+
+    var cardTunnel = document.getElementById('cardTunnelClients');
+    if (cardTunnel) {
+      cardTunnel.style.opacity = isStandalone ? '0.3' : '';
+      cardTunnel.style.pointerEvents = isStandalone ? 'none' : '';
+    }
+
+    var badgeAuth = document.getElementById('badgeAuthRejected');
+    if (badgeAuth) {
+      badgeAuth.style.opacity = hasAuth ? '' : '0.3';
+    }
+
+    // Cards
+    document.getElementById('activeConns').textContent = fmtNumber(d.connections && d.connections.active);
+    document.getElementById('peakConns').textContent = fmtNumber(d.connections && d.connections.peak);
+    document.getElementById('totalConns').textContent = fmtNumber(d.connections && d.connections.total);
+
+    var txR = d.traffic ? d.traffic.tx_rate_bps : 0;
+    var rxR = d.traffic ? d.traffic.rx_rate_bps : 0;
+    document.getElementById('throughput').textContent = fmtRate(txR + rxR);
+    document.getElementById('txRate').textContent = fmtRate(txR);
+    document.getElementById('rxRate').textContent = fmtRate(rxR);
+
+    var clients = d.clients || [];
+    var onlineCount = clients.filter(function(c) { return c.status === 'online'; }).length;
+    document.getElementById('clientCount').textContent = clients.length;
+    document.getElementById('clientOnline').textContent = onlineCount;
+
+    document.getElementById('uptime').textContent = fmtUptime(d.server && d.server.uptime_secs);
+    document.getElementById('listenAddr').textContent = (d.server && d.server.listen_addr) || '--';
+
+    // Chart
+    if (d.traffic_history) {
+      drawChart(d.traffic_history.tx || [], d.traffic_history.rx || []);
+    }
+
+    // Topology
+    var active = (d.connections && d.connections.active) || 0;
+    renderTopology(mode, active, clients.length, d.top_ips || [], d.users || {});
+
+    // Errors
+    var err = d.errors || {};
+    document.getElementById('errConn').textContent = fmtNumber(err.connection_failed || 0);
+    document.getElementById('errDns').textContent = fmtNumber(err.dns_timeout || 0);
+    document.getElementById('errAuth').textContent = fmtNumber(err.auth_rejected || 0);
+    document.getElementById('errRelay').textContent = fmtNumber(err.relay_error || 0);
+
+    // Connection rate
+    document.getElementById('connRate').textContent = (d.rate && d.rate.connections_per_sec != null) ? d.rate.connections_per_sec.toFixed(1) : '--';
+
+    // Top IPs
+    var ips = (d.top_ips || []).slice(0, 5);
+    var ipContainer = document.getElementById('topIpsList');
+    if (ips.length === 0) {
+      ipContainer.innerHTML = '<div class="no-clients">No data</div>';
+    } else {
+      ipContainer.innerHTML = ips.map(function(item) {
+        return '<div class="ip-item"><span class="ip-addr">' + escHtml(item.ip) + '</span><span class="ip-count">' + fmtNumber(item.connections) + ' conn</span></div>';
+      }).join('');
+    }
+
+    // Clients table
+    var tbody = document.getElementById('clientsBody');
+    if (mode === 'standalone' || clients.length === 0) {
+      var msg = mode === 'standalone' ? 'No tunnel clients in standalone mode' : 'No tunnel clients connected';
+      tbody.innerHTML = '<tr><td colspan="7" class="no-clients">' + msg + '</td></tr>';
+    } else {
+      tbody.innerHTML = clients.map(function(c) {
+        var isOnline = c.status === 'online';
+        var poolSize = c.pool_size || 0;
+        var poolReady = c.pool_ready || 0;
+        var pct = poolSize > 0 ? (poolReady / poolSize * 100) : 0;
+        var barClass = pct < 50 ? 'pool-bar-fill warning' : 'pool-bar-fill';
+        var tx = c.tx_bytes != null ? fmtBytes(c.tx_bytes) : '--';
+        var rx = c.rx_bytes != null ? fmtBytes(c.rx_bytes) : '--';
+        var reqs = c.requests_served != null ? c.requests_served : '--';
+        var since = c.connected_secs != null ? fmtUptime(c.connected_secs) : '--';
+
+        return '<tr>' +
+          '<td><span class="status-dot ' + (isOnline ? 'online' : 'offline') + '"></span></td>' +
+          '<td class="client-id">' + escHtml(c.client_id || '--') + '</td>' +
+          '<td><div class="pool-bar-container"><div class="pool-bar"><div class="' + barClass + '" style="width:' + pct + '%"></div></div><span class="pool-text">' + poolReady + '/' + poolSize + '</span></div></td>' +
+          '<td>' + tx + '</td>' +
+          '<td>' + rx + '</td>' +
+          '<td>' + reqs + '</td>' +
+          '<td>' + since + '</td>' +
+        '</tr>';
+      }).join('');
+    }
+
+    // Footer
+    document.getElementById('footerVersion').textContent = 'sox v' + ((d.server && d.server.version) || '--');
+  }
+
+  function escHtml(s) {
+    var el = document.createElement('span');
+    el.textContent = s;
+    return el.innerHTML;
+  }
+
+  function topoNode(color, val, label, sub) {
+    return '<div class="topo-node">' +
+      '<div class="topo-box ' + color + '"><div class="topo-val">' + val + '</div></div>' +
+      '<div class="topo-label">' + label + '</div>' +
+      '<div class="topo-count">' + sub + '</div>' +
+    '</div>';
+  }
+
+  function topoArrow(label) {
+    return '<div class="topo-arrow">' +
+      '<div class="topo-arrow-line"></div>' +
+      '<div class="topo-arrow-head"></div>' +
+      '<div class="topo-arrow-label">' + label + '</div>' +
+    '</div>';
+  }
+
+  function renderTopology(mode, activeConns, clientCount, topIps, usersInfo) {
+    var container = document.getElementById('topologyContainer');
+    if (!container) return;
+
+    var uniqueIps = topIps ? topIps.length : 0;
+    var hasAuth = usersInfo && usersInfo.authenticated;
+    var userCount = usersInfo ? (usersInfo.count || 0) : 0;
+
+    var firstVal = hasAuth ? userCount : activeConns;
+    var firstLabel = hasAuth ? 'Users' : 'Connections';
+    var firstSub = hasAuth
+      ? userCount + ' authenticated'
+      : uniqueIps + ' source IP' + (uniqueIps !== 1 ? 's' : '');
+    var arrow1 = hasAuth ? 'SOCKS5+Auth' : 'SOCKS5';
+
+    if (mode === 'standalone') {
+      container.innerHTML =
+        topoNode('blue', firstVal, firstLabel, firstSub) +
+        topoArrow(arrow1) +
+        topoNode('amber', 'S', 'sox', 'standalone') +
+        topoArrow('direct') +
+        topoNode('green', 'T', 'Targets', 'internet');
+    } else {
+      container.innerHTML =
+        topoNode('blue', firstVal, firstLabel, firstSub) +
+        topoArrow(arrow1) +
+        topoNode('amber', 'S', 'Server', ':1080') +
+        topoArrow('Noise') +
+        topoNode('purple', clientCount, 'Clients', clientCount + ' nodes') +
+        topoArrow('internal') +
+        topoNode('red', 'N', 'Internal', 'targets');
+    }
+  }
+
+  // --- Fetch loop ---
+  function fetchStatus() {
+    fetch('/api/status?window=' + currentWindow)
+      .then(function(res) {
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        return res.json();
+      })
+      .then(function(data) {
+        setConnected(true);
+        updateDashboard(data);
+      })
+      .catch(function() {
+        setConnected(false);
+      });
+  }
+
+  // --- Time slot buttons ---
+  document.querySelectorAll('.time-btn').forEach(function(btn) {
+    btn.addEventListener('click', function() {
+      document.querySelectorAll('.time-btn').forEach(function(b) { b.classList.remove('active'); });
+      btn.classList.add('active');
+      currentWindow = parseInt(btn.getAttribute('data-window'), 10);
+      fetchStatus();
+    });
+  });
+
+  // --- Init ---
+  fetchStatus();
+  setInterval(fetchStatus, 3000);
+
+})();
+</script>
+</body>
+</html>
