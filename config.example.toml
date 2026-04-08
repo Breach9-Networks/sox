@@ -1,0 +1,39 @@
+# sox configuration file
+# Copy this to config.toml and modify as needed.
+
+# SOCKS proxy listen address
+listen = "0.0.0.0:1080"
+
+# Connection limits
+max_connections = 10000
+max_connections_per_ip = 100
+
+# Timeouts (in seconds)
+handshake_timeout = 5
+connect_timeout = 10
+dns_timeout = 5
+idle_timeout = 300
+drain_timeout = 30
+
+# Authentication (optional)
+# Remove this section to disable authentication.
+[auth]
+users = [
+  { username = "alice", password = "secret" },
+  { username = "bob", password = "hunter2" },
+]
+
+# TCP keepalive settings
+[keepalive]
+idle = 30       # Seconds before first probe
+interval = 10   # Seconds between probes
+probes = 3      # Number of probes before declaring dead
+
+# Tunnel settings (for server/client mode)
+[tunnel]
+listen = "0.0.0.0:9090"      # Server: tunnel listen address
+secret = "change-me"          # Shared secret for Noise encryption
+# server_addr = "1.2.3.4:9090"  # Client: server address
+# client_id = "office-node"     # Client: unique identifier
+# pool_size = 10                # Client: pre-established connections
+# reconnect_interval = 5        # Client: reconnect interval (seconds)

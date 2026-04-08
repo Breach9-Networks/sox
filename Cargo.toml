@@ -1,0 +1,29 @@
+[package]
+name = "sox"
+version = "0.1.0"
+edition = "2024"
+description = "A high-performance, cross-platform SOCKS proxy server with reverse tunnel support"
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "signal", "macros", "time", "sync"] }
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+thiserror = "2"
+socket2 = "0.5"
+tokio-util = "0.7"
+snow = "0.9"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+serde_json = "1"
+blake2 = "0.10"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
