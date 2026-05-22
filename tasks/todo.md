@@ -51,19 +51,24 @@
 
 - DNS-aware UDP 生命週期：只跑 DNS 的 UDP 關聯閒置 3s 即提早關閉，不再佔住
   yamux stream／socket 到 idle timeout。`relay_udp` 與 `relay_udp_tunneled`
-  皆已接上，共 63 測試。
+  皆已接上。
+- RAII metrics guard：`connection_opened()` 回傳 `ConnectionGuard`，drop 時
+  遞減 active 計數 —— 連線處理 panic 也不會讓 dashboard 數字虛高。
 
 **待辦（TrustTunnel 可再借鏡，依優先序）**
 
-- Lazy 連線限制 acquire：限制「已認證」連線而非 idle TCP accept。
 - Graceful shutdown completion barrier：tunnel 側等 in-flight relay 收尾再關。
-- RAII metrics guard：active 計數綁物件生命週期，防 panic 路徑洩漏。
 - accept loop 致命錯誤（`EMFILE`）用 watch-channel 傳播，避免 busy-spin。
 - monitor dashboard 加 Bearer token 認證。
 - `sox init` 互動式設定精靈 + 高強度隨機 secret 產生。
 - 啟動自動抬高 fd limit（目前只檢查並警告）。
 - IdChain 階層式 log ID、Prometheus `/metrics` endpoint、可選 crash 上報。
 - Noise NN → XX/IK 升級（mutual auth、可撤銷單一 client key）。
+
+**評估後不採用**
+
+- Lazy 連線限制 acquire（TrustTunnel）：那是為「限制付費 VPN 用戶」設計；
+  對 sox，per-IP 連線限制是濫用防護，本就該在 accept 當下生效，不抄。
 
 **已知小瑕疵**
 
