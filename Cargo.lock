@@ -900,6 +900,7 @@ dependencies = [
  "blake2",
  "clap",
  "libc",
+ "rand",
  "serde",
  "serde_json",
  "snow",

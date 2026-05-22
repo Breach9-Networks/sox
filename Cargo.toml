@@ -18,6 +18,7 @@ toml = "0.8"
 serde_json = "1"
 blake2 = "0.10"
 yamux = "0.13"
+rand = "0.9"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

@@ -1,3 +1,4 @@
+pub mod backoff;
 pub mod noise;
 pub mod noise_stream;
 pub mod pool;
