@@ -19,7 +19,7 @@ use crate::protocol::socks5::handshake::{
 use crate::protocol::socks5::reply::write_command_reply;
 use crate::protocol::socks5::{AuthMethod, ReplyCode, Socks5Command};
 use crate::relay::tcp::{relay_bidirectional, relay_tcp_live};
-use crate::relay::udp::relay_udp;
+use crate::relay::udp::{relay_udp, relay_udp_tunneled};
 use crate::server::ServerContext;
 
 /// Handle a SOCKS connection — detects version (4/5) then dispatches.
@@ -542,42 +542,39 @@ async fn handle_udp_associate(
     peer_addr: SocketAddr,
     ctx: &ServerContext,
 ) -> Result<(), ServerError> {
-    // Bind a UDP relay socket
+    // Bind a UDP relay socket for the SOCKS client to send datagrams to.
     let relay_socket = UdpSocket::bind("0.0.0.0:0").await?;
     let relay_addr = relay_socket.local_addr()?;
 
-    tracing::debug!(
-        %peer_addr,
-        relay = %relay_addr,
-        "UDP ASSOCIATE relay bound"
-    );
+    tracing::debug!(%peer_addr, relay = %relay_addr, "UDP ASSOCIATE relay bound");
 
-    // Reply with the relay socket address
+    // Reply with the relay socket address.
     let bind_addr = TargetAddr::Ip(relay_addr);
     let mut reply = Vec::new();
     write_command_reply(ReplyCode::Succeeded, &bind_addr, &mut reply);
     stream.write_all(&reply).await?;
 
-    // The client will send UDP datagrams to the relay socket.
-    // Use the client's address for filtering (use peer's IP + the port they say, or any port).
-    // RFC says client sends from its UDP port, which we learn from the first packet.
-    // For simplicity, use a wildcard that accepts from the peer's IP on any port.
-    let client_udp_addr = SocketAddr::new(peer_addr.ip(), 0);
-
-    // We need to split: TCP control stream stays open, UDP relay runs
-    // When TCP closes, UDP relay stops
+    // When the TCP control stream closes, the UDP relay must stop.
     let cancel = CancellationToken::new();
 
-    // Move the TcpStream ownership to the UDP relay for monitoring
-    // We can't split borrow here, so we consume the stream
-    // Duplicate the TCP stream FD for control channel monitoring.
-    // The relay monitors this for closure while the original stays valid.
+    // Duplicate the TCP stream FD so the relay can monitor it for closure
+    // while the original stays valid.
     let tcp_control = {
         let sock_ref = SockRef::from(&*stream);
         let dup_socket = sock_ref.try_clone()?;
         TcpStream::from_std(std::net::TcpStream::from(dup_socket))?
     };
 
+    // Tunnel mode: route UDP through a tunnel client.
+    if let Some(router) = &ctx.router {
+        return handle_udp_associate_via_tunnel(
+            peer_addr, relay_socket, tcp_control, ctx, router, cancel,
+        )
+        .await;
+    }
+
+    // Standalone mode: relay directly from this server.
+    let client_udp_addr = SocketAddr::new(peer_addr.ip(), 0);
     let relay_result = tokio::time::timeout(
         ctx.config.idle_timeout,
         relay_udp(tcp_control, relay_socket, client_udp_addr, cancel),
@@ -589,14 +586,65 @@ async fn handle_udp_associate(
             tracing::debug!(%peer_addr, "UDP ASSOCIATE relay finished");
             Ok(())
         }
-        Ok(Err(e)) => {
-            tracing::debug!(%peer_addr, error = %e, "UDP ASSOCIATE relay error");
-            Err(ServerError::Io(e))
+        Ok(Err(e)) => Err(ServerError::Io(e)),
+        Err(_) => Err(ServerError::Timeout),
+    }
+}
+
+/// Route a UDP ASSOCIATE session through a tunnel client over a yamux stream.
+async fn handle_udp_associate_via_tunnel(
+    peer_addr: SocketAddr,
+    relay_socket: UdpSocket,
+    tcp_control: TcpStream,
+    ctx: &ServerContext,
+    router: &std::sync::Arc<crate::tunnel::router::Router>,
+    cancel: CancellationToken,
+) -> Result<(), ServerError> {
+    use crate::tunnel::protocol::StreamOpen;
+    use tokio_util::compat::FuturesAsyncReadCompatExt;
+
+    let tunnel = router.open_stream(None).await.ok_or_else(|| {
+        ServerError::Io(std::io::Error::new(
+            std::io::ErrorKind::NotConnected,
+            "no tunnel clients available",
+        ))
+    })?;
+    let mut tunnel_io = tunnel.stream.compat();
+
+    // Open a UDP stream: write the preamble, await the client's reply.
+    tunnel_io.write_all(&StreamOpen::Udp.encode()).await?;
+    let reply = match tokio::time::timeout(
+        ctx.config.connect_timeout,
+        read_stream_reply(&mut tunnel_io),
+    )
+    .await
+    {
+        Ok(Ok(r)) => r,
+        Ok(Err(e)) => return Err(ServerError::Io(e)),
+        Err(_) => return Err(ServerError::Timeout),
+    };
+    if reply.status != 0 {
+        return Err(ServerError::Io(std::io::Error::new(
+            std::io::ErrorKind::ConnectionRefused,
+            reply.message,
+        )));
+    }
+
+    tracing::debug!(%peer_addr, "UDP ASSOCIATE routed through tunnel");
+
+    let relay_result = tokio::time::timeout(
+        ctx.config.idle_timeout,
+        relay_udp_tunneled(tcp_control, relay_socket, peer_addr.ip(), tunnel_io, cancel),
+    )
+    .await;
+
+    match relay_result {
+        Ok(Ok(())) => {
+            tracing::debug!(%peer_addr, "tunnel UDP ASSOCIATE finished");
+            Ok(())
         }
-        Err(_) => {
-            tracing::debug!(%peer_addr, "UDP ASSOCIATE idle timeout");
-            Err(ServerError::Timeout)
-        }
+        Ok(Err(e)) => Err(ServerError::Io(e)),
+        Err(_) => Err(ServerError::Timeout),
     }
 }
 

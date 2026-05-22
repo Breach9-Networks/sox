@@ -4,21 +4,24 @@
 //! - Server 端：`server_session_driver` 驅動一條 session，依請求開 outbound stream。
 
 use std::io;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::mpsc;
 use tokio_util::compat::{FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt};
 use tokio_util::sync::CancellationToken;
 use yamux::{Config, Connection, Mode, Stream};
 
+use crate::protocol::addr::TargetAddr;
 use crate::protocol::socks5::ReplyCode;
 use crate::relay::tcp::relay_bidirectional;
+use crate::relay::udp::{read_udp_datagram, resolve_udp_target};
 use crate::tunnel::backoff::Backoff;
 use crate::tunnel::noise::{derive_psk, NoiseStream};
 use crate::tunnel::noise_stream::NoiseByteStream;
-use crate::tunnel::protocol::{Hello, HelloAck, StreamOpen, StreamReply, PROTO_VERSION};
+use crate::tunnel::protocol::{Hello, HelloAck, StreamOpen, StreamReply, UdpDatagram, PROTO_VERSION};
 use crate::tunnel::router::StreamRequest;
 
 /// session 穩定存活超過此時間後，視為「健康」，重連退避歸零。
@@ -245,13 +248,63 @@ async fn handle_inbound_stream(stream: Stream) {
             }
         }
         StreamOpen::Udp => {
-            // Task 16 會實作 UDP-over-tunnel；目前回報尚未支援。
-            let reply = StreamReply {
-                status: ReplyCode::CommandNotSupported as u8,
-                message: "UDP over tunnel not yet supported".into(),
-            };
-            let _ = io.write_all(&reply.encode()).await;
+            handle_udp_stream(io).await;
         }
+    }
+}
+
+/// 處理一條 UDP-over-tunnel stream：回 reply、bind UDP socket、雙向橋接。
+async fn handle_udp_stream<S>(mut io: S)
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let reply = StreamReply { status: 0, message: String::new() };
+    if io.write_all(&reply.encode()).await.is_err() {
+        return;
+    }
+    let socket = match UdpSocket::bind("0.0.0.0:0").await {
+        Ok(s) => Arc::new(s),
+        Err(e) => {
+            tracing::debug!(error = %e, "UDP socket bind failed");
+            return;
+        }
+    };
+    tracing::debug!("tunnel UDP flow established");
+    let (sr, sw) = tokio::io::split(io);
+    tokio::select! {
+        _ = client_udp_t2s(sr, socket.clone()) => {}
+        _ = client_udp_s2t(sw, socket) => {}
+    }
+}
+
+/// tunnel stream → 真實 UDP socket：讀 datagram、解析目標、發出。
+async fn client_udp_t2s<R>(mut sr: R, socket: Arc<UdpSocket>) -> io::Result<()>
+where
+    R: AsyncRead + Unpin,
+{
+    loop {
+        let dat = read_udp_datagram(&mut sr).await?;
+        let dest = match resolve_udp_target(&dat.addr).await {
+            Ok(a) => a,
+            Err(_) => continue,
+        };
+        socket.send_to(&dat.payload, dest).await?;
+    }
+}
+
+/// 真實 UDP socket → tunnel stream：收回包、以來源位址 framing 後送回。
+async fn client_udp_s2t<W>(mut sw: W, socket: Arc<UdpSocket>) -> io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    let mut buf = vec![0u8; 65535];
+    loop {
+        let (n, src) = socket.recv_from(&mut buf).await?;
+        let dat = UdpDatagram {
+            addr: TargetAddr::Ip(src),
+            payload: buf[..n].to_vec(),
+        };
+        sw.write_all(&dat.encode()).await?;
     }
 }
 
