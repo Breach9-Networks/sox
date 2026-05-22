@@ -10,15 +10,15 @@ A high-performance, cross-platform SOCKS proxy server with reverse tunnel suppor
 - **Noise Protocol encryption** - lightweight, no certificates needed (same as WireGuard)
 - **Monitor Dashboard** - real-time web UI with traffic charts, client topology, and connection stats
 - **Username/password authentication** (RFC 1929)
-- **Connection reuse** - pool connections serve multiple requests without re-handshaking
+- **Stream multiplexing** - many proxy flows share a few yamux sessions over one Noise handshake
 - **Connection stability** - TCP keepalive, per-state timeouts, graceful half-close
 - **Resource protection** - global + per-IP connection limits, tunnel connection limits, FD limit check
-- **Auto-reconnect** - client retries for up to 30 minutes on server disconnect
+- **Auto-reconnect** - tunnel sessions reconnect independently with exponential backoff
 - **Graceful shutdown** - connection draining with configurable timeout
 - **Security hardened** - BLAKE2s PSK derivation, constant-time auth, Noise encryption
 - **TOML configuration** - file + CLI + env layered config
 - **Cross-platform** - Linux (static musl), macOS (ARM), Windows (x64)
-- **Lightweight** - ~1.3-1.9MB release binary, ~5000 lines of Rust, 49 unit tests
+- **Lightweight** - ~1.3-1.9MB release binary, written in Rust, 58 tests
 
 ## Architecture
 
@@ -31,7 +31,7 @@ A high-performance, cross-platform SOCKS proxy server with reverse tunnel suppor
                     ===========
   User --> SOCKS5/4 --> [Server]  <=== Noise encrypted ===>  [Client] --> Internal Target
            (public)      :1080        tunnel :9090           (internal)
-                           |                                   pool-size=200
+                           |                                 8 yamux sessions
                            |
                     Monitor Dashboard
                     =================
@@ -43,11 +43,9 @@ A high-performance, cross-platform SOCKS proxy server with reverse tunnel suppor
 **Tunnel mode**: Server runs on public network, Client runs on internal network.
 Client connects outward to Server (NAT traversal), then Server routes SOCKS requests
 through the encrypted tunnel to Client, which connects to targets on the internal network.
-The connection pool (default 200 connections) pre-establishes Noise-encrypted TCP connections
-so that each SOCKS request can be served immediately without handshake latency.
-Each pool connection reuses the same Noise stream across multiple requests — after a relay
-completes, the connection is returned to the pool and immediately available for the next request,
-eliminating reconnection overhead.
+The Client maintains a small set of yamux sessions (default 8) — each one TCP + Noise — and
+the Server multiplexes every SOCKS request as an independent yamux stream over them. yamux's
+per-stream flow control keeps a slow flow from blocking its co-tenants on the same session.
 
 ## Quick Start
 
@@ -142,7 +140,7 @@ sox client \
   --server-addr your-server.com:9090 \
   --secret "your-shared-key" \
   --client-id office-node \
-  --pool-size 200
+  --tunnel-sessions 8
 ```
 
 Now, users can proxy through the public server to reach internal resources:
@@ -164,7 +162,7 @@ The dashboard provides a **Cyber Dark** themed web UI with:
 
 - **Real-time traffic charts** — bytes in/out over 5m, 15m, 30m, and 1h windows
 - **Architecture topology** — visual diagram of Server/Client tunnel connections
-- **Client table** — connected clients with pool size, active/idle connections, traffic stats
+- **Client table** — connected clients with session count, traffic stats, requests served
 - **Error stats** — authentication failures, connection errors, protocol errors
 - **Connection rate** — current connections per second
 - **Top IPs** — most active source IPs by connection count
@@ -179,7 +177,7 @@ The monitor also exposes JSON API endpoints:
 | `GET /api/status` | Full status: server info, connections, traffic (live), errors, rate, top IPs, clients, traffic history |
 | `GET /api/status?window=N` | Same, with traffic history for last N seconds (300/900/1800/3600) |
 | `GET /api/metrics` | Compact metrics: active connections, total, tx/rx bytes |
-| `GET /api/clients` | Tunnel clients: pool status, live tx/rx, requests served, uptime |
+| `GET /api/clients` | Tunnel clients: session count, live tx/rx, requests served, uptime |
 
 ```bash
 # Full status with 5-minute traffic history
@@ -219,19 +217,19 @@ sox standalone [OPTIONS]
       --monitor <ADDR>          Enable monitor dashboard [e.g. 0.0.0.0:8080]
   -v, --verbosity <LEVEL>       Log level [default: info]
 
-sox server [OPTIONS] --secret <SECRET>
+sox server [OPTIONS]
   -s, --socks-listen <ADDR>     SOCKS listen address [default: 0.0.0.0:1080]
   -t, --tunnel-listen <ADDR>    Tunnel listen address [default: 0.0.0.0:9090]
-      --secret <SECRET>         Shared secret for Noise encryption
+      --secret <SECRET>         Shared secret (or set [tunnel] secret in config)
   -u, --user <USER:PASS>        Add SOCKS auth credentials (repeatable)
       --monitor <ADDR>          Enable monitor dashboard [e.g. 0.0.0.0:8080]
 
-sox client [OPTIONS] --server-addr <ADDR> --secret <SECRET>
+sox client [OPTIONS] --server-addr <ADDR>
   -s, --server-addr <ADDR>      Server tunnel address
-      --secret <SECRET>         Shared secret (must match server)
+      --secret <SECRET>         Shared secret (or set [tunnel] secret in config)
       --client-id <ID>          Client identifier [default: default]
-      --pool-size <N>           Pre-established connections [default: 200]
-      --reconnect-interval <S>  Reconnect interval in seconds [default: 5]
+      --tunnel-sessions <N>     Concurrent yamux sessions [default: 8]
+      --reconnect-interval <S>  Reconnect backoff base in seconds [default: 5]
 ```
 
 ### TOML Config File
@@ -253,8 +251,15 @@ interval = 10
 probes = 3
 
 [tunnel]
-listen = "0.0.0.0:9090"
-secret = "your-shared-key"
+listen = "0.0.0.0:9090"            # server: tunnel listen address
+secret = "your-shared-key"          # shared between server and client
+server_addr = "your-server:9090"    # client: where to connect
+client_id = "office-node"           # client: identifier
+tunnel_sessions = 8                 # client: concurrent yamux sessions
+max_streams_per_session = 256       # per-session yamux stream cap
+recv_window_mb = 64                 # per-session yamux receive window (MiB)
+reconnect_interval = 5              # reconnect backoff base (seconds)
+reconnect_max = 60                  # reconnect backoff cap (seconds)
 ```
 
 Config priority: CLI args > TOML file > defaults.
@@ -265,34 +270,35 @@ See [`config.example.toml`](config.example.toml) for a full example.
 
 ### Tunnel Protocol
 
-The tunnel uses a **Connection Pool** architecture (default pool size: 200):
-
-1. **Control channel** - one persistent TCP connection (Noise encrypted) for registration and heartbeat
-2. **Data channels** - N pre-established TCP connections, each individually Noise-encrypted, ready to serve SOCKS requests
+The tunnel is a small set of **yamux-multiplexed sessions** (default 8). Each session is
+one TCP connection wrapped in Noise encryption; every SOCKS request becomes an independent
+yamux stream multiplexed over a session.
 
 When a SOCKS request arrives at the Server:
 
 ```
 1. Server receives SOCKS5 CONNECT example.com:80
-2. Server picks an idle data connection from the Client's pool
-3. Server sends ProxyRequest { target: "example.com:80" } over the data connection
-4. Client receives it, connects to example.com:80 on the internal network
-5. Client sends ProxyReply { success: true }
+2. Server opens a new yamux stream on one of the Client's sessions (round-robin)
+3. Server writes a StreamOpen preamble { target: "example.com:80" } on the stream
+4. Client accepts the stream, connects to example.com:80 on the internal network
+5. Client writes a StreamReply { status: ok, bound address }
 6. Server replies SOCKS5 success to the user
-7. Bidirectional relay: User <-> Server <--(Noise encrypted)--> Client <-> Target
-8. Client sends DataReady to signal completion
-9. Server receives DataReady, returns connection to pool for reuse (no reconnect needed)
+7. Bidirectional relay over the stream: User <-> Server <--(Noise)--> Client <-> Target
+8. When either side closes, the yamux stream closes — no pooling, no reuse dance
 ```
+
+UDP ASSOCIATE works the same way over a dedicated yamux stream that carries framed
+datagrams. yamux provides per-stream credit-based flow control, so a slow or stalled
+flow only backs up its own stream, never its co-tenants on the same session.
 
 ### Multi-Client Routing
 
-When multiple Clients are connected, the Server picks the first Client with an available
-idle connection (HashMap iteration order, pseudo-random). Traffic is not round-robin —
-a Client whose hash key comes first will be used until its pool is exhausted, then the
-next Client is tried.
+When multiple Clients are connected, the Server picks the first Client with a live
+session (HashMap iteration order). Within that Client, new streams are opened
+round-robin across its sessions.
 
-Per-client traffic counters (TX/RX bytes, requests served) are **preserved across reconnects** —
-if a Client disconnects and reconnects, its cumulative stats continue from where they left off.
+Per-client traffic counters (TX/RX bytes, requests served) are **preserved across
+reconnects** — cumulative stats continue from where they left off.
 
 ### Encryption
 
@@ -303,7 +309,7 @@ Tunnel connections use **Noise Protocol** (Noise_NNpsk0_25519_ChaChaPoly_BLAKE2s
 - Curve25519 key exchange
 - Same cryptographic foundation as WireGuard
 - Constant-time password comparison (timing attack resistant)
-- Each pool connection performs its own Noise handshake once, then reuses for multiple requests
+- Each session performs one Noise handshake; all of its multiplexed streams share that channel
 
 ### Stability
 
@@ -312,8 +318,8 @@ Tunnel connections use **Noise Protocol** (Noise_NNpsk0_25519_ChaChaPoly_BLAKE2s
 - **TCP keepalive**: idle 30s, interval 10s, 3 probes
 - **Three-layer connection protection**: global semaphore + per-IP limit + FD limit check
 - **Graceful shutdown**: stop accepting -> drain connections -> timeout abort
-- **Auto-reconnect**: Client retries every 5s (configurable), gives up after 30 minutes of continuous failure
-- **Tunnel connection limit**: max 2048 concurrent tunnel connections to prevent resource exhaustion
+- **Auto-reconnect**: each tunnel session reconnects independently with exponential backoff (base 5s, cap 60s, ±20% jitter)
+- **Tunnel connection limit**: max 2048 concurrent tunnel sessions to prevent resource exhaustion
 
 ## Comparison
 

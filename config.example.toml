@@ -31,9 +31,12 @@ probes = 3      # Number of probes before declaring dead
 
 # Tunnel settings (for server/client mode)
 [tunnel]
-listen = "0.0.0.0:9090"      # Server: tunnel listen address
-secret = "change-me"          # Shared secret for Noise encryption
-# server_addr = "1.2.3.4:9090"  # Client: server address
-# client_id = "office-node"     # Client: unique identifier
-# pool_size = 10                # Client: pre-established connections
-# reconnect_interval = 5        # Client: reconnect interval (seconds)
+listen = "0.0.0.0:9090"           # Server: tunnel listen address
+secret = "change-me"              # Shared secret for Noise encryption (server + client)
+# server_addr = "1.2.3.4:9090"      # Client: server address
+# client_id = "office-node"         # Client: unique identifier
+# tunnel_sessions = 8               # Client: concurrent yamux sessions
+# max_streams_per_session = 256     # Per-session yamux stream cap
+# recv_window_mb = 64               # Per-session yamux receive window (MiB)
+# reconnect_interval = 5            # Reconnect backoff base (seconds)
+# reconnect_max = 60                # Reconnect backoff cap (seconds)
