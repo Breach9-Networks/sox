@@ -118,6 +118,88 @@ impl HelloAck {
     }
 }
 
+/// Stream preamble — server 開 yamux stream 後寫的開頭位元組。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StreamOpen {
+    /// 0x01：TCP connect 到 target（"host:port"）。
+    Tcp { target: String },
+    /// 0x02：UDP associate。
+    Udp,
+}
+
+impl StreamOpen {
+    pub fn encode(&self) -> Vec<u8> {
+        match self {
+            StreamOpen::Tcp { target } => {
+                let t = target.as_bytes();
+                let mut buf = Vec::with_capacity(3 + t.len());
+                buf.push(0x01);
+                buf.extend_from_slice(&(t.len() as u16).to_be_bytes());
+                buf.extend_from_slice(t);
+                buf
+            }
+            StreamOpen::Udp => vec![0x02],
+        }
+    }
+
+    /// 回傳 (訊息, 消費的位元組數)。資料不足時回 Err。
+    pub fn decode(buf: &[u8]) -> Result<(Self, usize), ServerError> {
+        match buf.first() {
+            Some(0x01) => {
+                if buf.len() < 3 {
+                    return Err(decode_err("StreamOpen::Tcp: need target_len"));
+                }
+                let t_len = u16::from_be_bytes([buf[1], buf[2]]) as usize;
+                if buf.len() < 3 + t_len {
+                    return Err(decode_err("StreamOpen::Tcp: target incomplete"));
+                }
+                let target = String::from_utf8_lossy(&buf[3..3 + t_len]).into_owned();
+                Ok((StreamOpen::Tcp { target }, 3 + t_len))
+            }
+            Some(0x02) => Ok((StreamOpen::Udp, 1)),
+            Some(other) => Err(decode_err(&format!("StreamOpen: unknown kind {other:#x}"))),
+            None => Err(decode_err("StreamOpen: empty")),
+        }
+    }
+}
+
+/// Stream preamble 回應 — client 回寫的開頭位元組。
+#[derive(Debug, Clone)]
+pub struct StreamReply {
+    /// 0 = ok；非 0 = 錯誤碼（對映 SOCKS5 reply code）。
+    pub status: u8,
+    /// 成功為 bind addr，失敗為錯誤訊息。
+    pub message: String,
+}
+
+impl StreamReply {
+    pub fn encode(&self) -> Vec<u8> {
+        let m = self.message.as_bytes();
+        let mut buf = Vec::with_capacity(3 + m.len());
+        buf.push(self.status);
+        buf.extend_from_slice(&(m.len() as u16).to_be_bytes());
+        buf.extend_from_slice(m);
+        buf
+    }
+
+    pub fn decode(buf: &[u8]) -> Result<(Self, usize), ServerError> {
+        if buf.len() < 3 {
+            return Err(decode_err("StreamReply: too short"));
+        }
+        let m_len = u16::from_be_bytes([buf[1], buf[2]]) as usize;
+        if buf.len() < 3 + m_len {
+            return Err(decode_err("StreamReply: message incomplete"));
+        }
+        Ok((
+            StreamReply {
+                status: buf[0],
+                message: String::from_utf8_lossy(&buf[3..3 + m_len]).into_owned(),
+            },
+            3 + m_len,
+        ))
+    }
+}
+
 /// Messages exchanged over the tunnel.
 #[derive(Debug, Clone)]
 pub enum TunnelMessage {
@@ -367,6 +449,42 @@ mod tests {
     #[test]
     fn hello_decode_rejects_truncated() {
         assert!(Hello::decode(&[1, 0]).is_err());
+    }
+
+    #[test]
+    fn roundtrip_stream_open_tcp() {
+        let msg = StreamOpen::Tcp { target: "example.com:443".into() };
+        let bytes = msg.encode();
+        let (decoded, consumed) = StreamOpen::decode(&bytes).unwrap();
+        assert_eq!(consumed, bytes.len());
+        match decoded {
+            StreamOpen::Tcp { target } => assert_eq!(target, "example.com:443"),
+            _ => panic!("wrong kind"),
+        }
+    }
+
+    #[test]
+    fn roundtrip_stream_open_udp() {
+        let bytes = StreamOpen::Udp.encode();
+        let (decoded, consumed) = StreamOpen::decode(&bytes).unwrap();
+        assert_eq!(consumed, 1);
+        assert!(matches!(decoded, StreamOpen::Udp));
+    }
+
+    #[test]
+    fn stream_open_decode_needs_more() {
+        // 只給 kind + 半截 target_len → 回報需要更多資料
+        assert!(StreamOpen::decode(&[0x01, 0x00]).is_err());
+    }
+
+    #[test]
+    fn roundtrip_stream_reply() {
+        let ok = StreamReply { status: 0, message: "10.0.0.1:5555".into() };
+        let encoded = ok.encode();
+        let (d, n) = StreamReply::decode(&encoded).unwrap();
+        assert_eq!(n, encoded.len());
+        assert_eq!(d.status, 0);
+        assert_eq!(d.message, "10.0.0.1:5555");
     }
 
     #[test]
