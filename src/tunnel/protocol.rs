@@ -48,6 +48,76 @@ impl MessageType {
     }
 }
 
+/// 目前的 tunnel 協定版本。Hello 不符即拒絕。
+pub const PROTO_VERSION: u8 = 1;
+
+/// Session 握手訊息（client → server），yamux 之前交換。
+#[derive(Debug, Clone)]
+pub struct Hello {
+    pub proto_version: u8,
+    pub session_index: u16,
+    pub client_id: String,
+}
+
+impl Hello {
+    pub fn encode(&self) -> Vec<u8> {
+        let id = self.client_id.as_bytes();
+        let mut buf = Vec::with_capacity(4 + id.len());
+        buf.push(self.proto_version);
+        buf.extend_from_slice(&self.session_index.to_be_bytes());
+        buf.push(id.len() as u8);
+        buf.extend_from_slice(id);
+        buf
+    }
+
+    pub fn decode(buf: &[u8]) -> Result<Self, ServerError> {
+        if buf.len() < 4 {
+            return Err(decode_err("Hello: too short"));
+        }
+        let id_len = buf[3] as usize;
+        if buf.len() < 4 + id_len {
+            return Err(decode_err("Hello: client_id incomplete"));
+        }
+        Ok(Hello {
+            proto_version: buf[0],
+            session_index: u16::from_be_bytes([buf[1], buf[2]]),
+            client_id: String::from_utf8_lossy(&buf[4..4 + id_len]).into_owned(),
+        })
+    }
+}
+
+/// Session 握手回應（server → client）。
+#[derive(Debug, Clone)]
+pub struct HelloAck {
+    pub accepted: bool,
+    pub reason: String,
+}
+
+impl HelloAck {
+    pub fn encode(&self) -> Vec<u8> {
+        let r = self.reason.as_bytes();
+        let mut buf = Vec::with_capacity(3 + r.len());
+        buf.push(self.accepted as u8);
+        buf.extend_from_slice(&(r.len() as u16).to_be_bytes());
+        buf.extend_from_slice(r);
+        buf
+    }
+
+    pub fn decode(buf: &[u8]) -> Result<Self, ServerError> {
+        if buf.len() < 3 {
+            return Err(decode_err("HelloAck: too short"));
+        }
+        let r_len = u16::from_be_bytes([buf[1], buf[2]]) as usize;
+        if buf.len() < 3 + r_len {
+            return Err(decode_err("HelloAck: reason incomplete"));
+        }
+        Ok(HelloAck {
+            accepted: buf[0] != 0,
+            reason: String::from_utf8_lossy(&buf[3..3 + r_len]).into_owned(),
+        })
+    }
+}
+
 /// Messages exchanged over the tunnel.
 #[derive(Debug, Clone)]
 pub enum TunnelMessage {
@@ -272,6 +342,32 @@ fn decode_err(msg: &str) -> ServerError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn roundtrip_hello() {
+        let msg = Hello { proto_version: 1, session_index: 3, client_id: "node-1".into() };
+        let decoded = Hello::decode(&msg.encode()).unwrap();
+        assert_eq!(decoded.proto_version, 1);
+        assert_eq!(decoded.session_index, 3);
+        assert_eq!(decoded.client_id, "node-1");
+    }
+
+    #[test]
+    fn roundtrip_hello_ack() {
+        let ok = HelloAck { accepted: true, reason: String::new() };
+        let decoded = HelloAck::decode(&ok.encode()).unwrap();
+        assert!(decoded.accepted);
+
+        let rej = HelloAck { accepted: false, reason: "version mismatch".into() };
+        let decoded = HelloAck::decode(&rej.encode()).unwrap();
+        assert!(!decoded.accepted);
+        assert_eq!(decoded.reason, "version mismatch");
+    }
+
+    #[test]
+    fn hello_decode_rejects_truncated() {
+        assert!(Hello::decode(&[1, 0]).is_err());
+    }
 
     #[test]
     fn roundtrip_register() {
