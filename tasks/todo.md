@@ -47,21 +47,23 @@
   失敗、連線被丟 —— 改為讀到 parser 回報完整為止。
 - 新增重現測試（standalone UDP、command 分片、auth 分片）。
 
-**已完成（TrustTunnel 借鏡）**
+**已完成（TrustTunnel 借鏡 / 健壯性）**
 
-- DNS-aware UDP 生命週期：只跑 DNS 的 UDP 關聯閒置 3s 即提早關閉，不再佔住
-  yamux stream／socket 到 idle timeout。`relay_udp` 與 `relay_udp_tunneled`
-  皆已接上。
+- DNS-aware UDP 生命週期：只跑 DNS 的 UDP 關聯閒置 3s 即提早關閉。
+  `relay_udp` 與 `relay_udp_tunneled` 皆已接上。
 - RAII metrics guard：`connection_opened()` 回傳 `ConnectionGuard`，drop 時
   遞減 active 計數 —— 連線處理 panic 也不會讓 dashboard 數字虛高。
+- Graceful shutdown：shutdown 改為 drain 進行中的 relay（`drain_timeout` 上限）
+  而非當場砍斷；`run_server` 補上 drain loop、tunnel 分階段關閉。
+- accept loop 韌性：accept 出錯（如 `EMFILE`）不再 `?` 殺死整台 server，
+  改為 log + 退讓 100ms + 繼續。
+- fd limit 自動抬高：`check_fd_limit` 本來就會把 soft 抬到 hard（原 backlog
+  記載「只檢查並警告」有誤）。
 
 **待辦（TrustTunnel 可再借鏡，依優先序）**
 
-- Graceful shutdown completion barrier：tunnel 側等 in-flight relay 收尾再關。
-- accept loop 致命錯誤（`EMFILE`）用 watch-channel 傳播，避免 busy-spin。
 - monitor dashboard 加 Bearer token 認證。
 - `sox init` 互動式設定精靈 + 高強度隨機 secret 產生。
-- 啟動自動抬高 fd limit（目前只檢查並警告）。
 - IdChain 階層式 log ID、Prometheus `/metrics` endpoint、可選 crash 上報。
 - Noise NN → XX/IK 升級（mutual auth、可撤銷單一 client key）。
 
