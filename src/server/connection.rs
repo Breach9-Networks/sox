@@ -18,7 +18,7 @@ use crate::protocol::socks5::handshake::{
 };
 use crate::protocol::socks5::reply::write_command_reply;
 use crate::protocol::socks5::{AuthMethod, ReplyCode, Socks5Command};
-use crate::relay::tcp::relay_tcp_live;
+use crate::relay::tcp::{relay_bidirectional, relay_tcp_live};
 use crate::relay::udp::relay_udp;
 use crate::server::ServerContext;
 
@@ -407,7 +407,7 @@ async fn handle_connect(
     Ok(())
 }
 
-/// Handle SOCKS5 CONNECT via a tunnel client.
+/// Handle SOCKS5 CONNECT via a tunnel client (yamux multiplexed).
 async fn handle_connect_via_tunnel(
     stream: &mut TcpStream,
     peer_addr: SocketAddr,
@@ -415,8 +415,9 @@ async fn handle_connect_via_tunnel(
     ctx: &ServerContext,
     router: &std::sync::Arc<crate::tunnel::router::Router>,
 ) -> Result<(), ServerError> {
-    use crate::tunnel::protocol::TunnelMessage;
+    use crate::tunnel::protocol::{StreamOpen, StreamReply};
     use std::sync::atomic::{AtomicBool, Ordering as AtomOrd};
+    use tokio_util::compat::FuturesAsyncReadCompatExt;
 
     // Rate-limit "no tunnel clients" warning: log once on transition, not per-request
     static NO_CLIENTS_LOGGED: AtomicBool = AtomicBool::new(false);
@@ -424,26 +425,15 @@ async fn handle_connect_via_tunnel(
     let config = &ctx.config;
     let target_str = target.to_string();
 
-    // Try to get a data connection from the pool with retry
-    let mut result = None;
-    for _ in 0..10 {
-        if let Some(r) = router.get_data_conn(None).await {
-            result = Some(r);
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-    }
-
-    let (client_id, mut data_conn, client_tx, client_rx) = match result {
-        Some(r) => {
-            // Client became available again — reset the flag
+    // Open a fresh yamux stream on one of the tunnel client's sessions.
+    let tunnel = match router.open_stream(None).await {
+        Some(t) => {
             if NO_CLIENTS_LOGGED.swap(false, AtomOrd::Relaxed) {
                 tracing::info!("tunnel client available again");
             }
-            r
+            t
         }
         None => {
-            // Only warn once when transitioning to "no clients"
             if !NO_CLIENTS_LOGGED.swap(true, AtomOrd::Relaxed) {
                 tracing::warn!("no tunnel clients available (suppressing further warnings)");
             }
@@ -461,122 +451,89 @@ async fn handle_connect_via_tunnel(
         }
     };
 
-    tracing::debug!(
-        %peer_addr, %target, %client_id,
-        "routing CONNECT through tunnel client (pool)"
-    );
+    let crate::tunnel::router::TunnelStream { stream: yamux_stream, tx_bytes, rx_bytes } = tunnel;
+    let mut tunnel_io = yamux_stream.compat();
 
-    // Send ProxyRequest over the data connection
-    static REQUEST_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-    let request_id = REQUEST_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    tracing::debug!(%peer_addr, %target, "routing CONNECT through tunnel");
 
-    let proxy_req = TunnelMessage::ProxyRequest {
-        request_id,
-        target: target_str.clone(),
-    };
-    data_conn.send(&proxy_req.encode()).await
-        .map_err(|e| ServerError::Io(e))?;
+    // Write the StreamOpen preamble, then read the client's StreamReply.
+    let preamble = StreamOpen::Tcp { target: target_str }.encode();
+    tunnel_io.write_all(&preamble).await?;
 
-    // Wait for ProxyReply
-    let reply_data = tokio::time::timeout(config.connect_timeout, data_conn.recv())
-        .await
-        .map_err(|_| ServerError::Timeout)?
-        .map_err(|e| ServerError::Io(e))?;
+    let reply: StreamReply =
+        match tokio::time::timeout(config.connect_timeout, read_stream_reply(&mut tunnel_io)).await {
+            Ok(Ok(r)) => r,
+            Ok(Err(e)) => return Err(ServerError::Io(e)),
+            Err(_) => return Err(ServerError::Timeout),
+        };
 
-    let reply_msg = TunnelMessage::decode(&reply_data)?;
-
-    match reply_msg {
-        TunnelMessage::ProxyReply { success, message, .. } => {
-            if !success {
-                tracing::debug!(%peer_addr, %target, %message, "tunnel client connect failed");
-                // Connection is still usable — return it to the pool
-                let _ = router.return_data_conn(&client_id, data_conn).await;
-                let mut reply = Vec::new();
-                write_command_reply(
-                    ReplyCode::ConnectionRefused,
-                    &TargetAddr::unspecified(),
-                    &mut reply,
-                );
-                stream.write_all(&reply).await?;
-                return Err(ServerError::Io(std::io::Error::new(
-                    std::io::ErrorKind::ConnectionRefused,
-                    message,
-                )));
-            }
-
-            let mut reply = Vec::new();
-            write_command_reply(
-                ReplyCode::Succeeded,
-                &TargetAddr::unspecified(),
-                &mut reply,
-            );
-            stream.write_all(&reply).await?;
-
-            tracing::debug!(
-                %peer_addr, %target, %client_id,
-                "tunnel CONNECT established, starting relay (pool)"
-            );
-
-            // Split NoiseStream for concurrent bidirectional framed relay
-            let (mut sender, mut receiver) = data_conn.split();
-
-            // Relay with live per-client counters; global counters updated after relay
-            let relay_result = crate::relay::tcp::relay_tunneled(
-                &mut sender,
-                &mut receiver,
-                stream,
-                Some(&client_tx),
-                Some(&client_rx),
-            )
-            .await;
-
-            // Reunite and wait for client's DataReady before returning to pool.
-            // This prevents a race where a new ProxyRequest is sent while the
-            // client is still finishing its relay.
-            match crate::tunnel::noise::NoiseStream::reunite(sender, receiver) {
-                Ok(mut noise) => {
-                    // Spawn a background task to wait for DataReady, so we don't
-                    // block the SOCKS handler. Client sends DataReady after its
-                    // relay completes and it's ready for the next request.
-                    let router = router.clone();
-                    let client_id = client_id.clone();
-                    tokio::spawn(async move {
-                        match noise.recv().await {
-                            Ok(data) => {
-                                if let Ok(TunnelMessage::DataReady { .. }) = TunnelMessage::decode(&data) {
-                                    let _ = router.return_data_conn(&client_id, noise).await;
-                                } else {
-                                    tracing::debug!(%client_id, "expected DataReady after relay, got something else");
-                                }
-                            }
-                            Err(e) => {
-                                tracing::debug!(%client_id, error = %e, "connection lost after relay");
-                            }
-                        }
-                    });
-                }
-                Err(e) => {
-                    tracing::debug!(error = %e, "failed to reunite NoiseStream");
-                }
-            }
-
-            let (c2s, s2c) = relay_result.unwrap_or((0, 0));
-
-            // Update global traffic counters
-            ctx.metrics.bytes_client_to_target.fetch_add(c2s, std::sync::atomic::Ordering::Relaxed);
-            ctx.metrics.bytes_target_to_client.fetch_add(s2c, std::sync::atomic::Ordering::Relaxed);
-
-            tracing::debug!(%peer_addr, %target, c2s, s2c, "tunnel relay finished");
-            Ok(())
-        }
-        other => {
-            tracing::warn!(%peer_addr, msg = ?other, "unexpected reply from tunnel client");
-            Err(ServerError::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "unexpected tunnel reply",
-            )))
-        }
+    if reply.status != 0 {
+        tracing::debug!(%peer_addr, %target, reason = %reply.message, "tunnel client connect failed");
+        let mut buf = Vec::new();
+        write_command_reply(
+            ReplyCode::from_u8(reply.status),
+            &TargetAddr::unspecified(),
+            &mut buf,
+        );
+        stream.write_all(&buf).await?;
+        return Err(ServerError::Io(std::io::Error::new(
+            std::io::ErrorKind::ConnectionRefused,
+            reply.message,
+        )));
     }
+
+    // Success — reply to the SOCKS client, then relay.
+    let mut buf = Vec::new();
+    write_command_reply(ReplyCode::Succeeded, &TargetAddr::unspecified(), &mut buf);
+    stream.write_all(&buf).await?;
+
+    tracing::debug!(%peer_addr, %target, "tunnel CONNECT established, starting relay");
+
+    // "tx" = SOCKS client -> target ; "rx" = target -> SOCKS client.
+    let relay_result = tokio::time::timeout(
+        config.idle_timeout,
+        relay_bidirectional(
+            stream,
+            &mut tunnel_io,
+            Some(tx_bytes.as_ref()),
+            Some(rx_bytes.as_ref()),
+        ),
+    )
+    .await;
+
+    let (c2s, s2c) = match relay_result {
+        Ok(Ok(bytes)) => bytes,
+        Ok(Err(e)) => {
+            tracing::debug!(%peer_addr, %target, error = %e, "tunnel relay error");
+            return Err(ServerError::Io(e));
+        }
+        Err(_) => {
+            tracing::debug!(%peer_addr, %target, "tunnel relay idle timeout");
+            return Err(ServerError::Timeout);
+        }
+    };
+
+    ctx.metrics.bytes_client_to_target.fetch_add(c2s, AtomOrd::Relaxed);
+    ctx.metrics.bytes_target_to_client.fetch_add(s2c, AtomOrd::Relaxed);
+
+    tracing::debug!(%peer_addr, %target, c2s, s2c, "tunnel relay finished");
+    Ok(())
+}
+
+/// Read a `StreamReply` preamble exactly off a tunnel stream (no over-read).
+async fn read_stream_reply<S>(s: &mut S) -> std::io::Result<crate::tunnel::protocol::StreamReply>
+where
+    S: tokio::io::AsyncRead + Unpin,
+{
+    let mut head = [0u8; 3];
+    s.read_exact(&mut head).await?;
+    let msg_len = u16::from_be_bytes([head[1], head[2]]) as usize;
+    let mut msg = vec![0u8; msg_len];
+    s.read_exact(&mut msg).await?;
+    Ok(crate::tunnel::protocol::StreamReply {
+        status: head[0],
+        message: String::from_utf8_lossy(&msg).into_owned(),
+    })
 }
 
 /// Handle SOCKS5 UDP ASSOCIATE command.

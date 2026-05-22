@@ -582,7 +582,7 @@ body {
         <tr>
           <th>Status</th>
           <th>Client ID</th>
-          <th>Pool</th>
+          <th>Sessions</th>
           <th>TX (total)</th>
           <th>RX (total)</th>
           <th>Requests</th>
@@ -783,10 +783,7 @@ body {
     } else {
       tbody.innerHTML = clients.map(function(c) {
         var isOnline = c.status === 'online';
-        var poolSize = c.pool_size || 0;
-        var poolReady = c.pool_ready || 0;
-        var pct = poolSize > 0 ? (poolReady / poolSize * 100) : 0;
-        var barClass = pct < 50 ? 'pool-bar-fill warning' : 'pool-bar-fill';
+        var sessions = c.sessions != null ? c.sessions : 0;
         var tx = c.tx_bytes != null ? fmtBytes(c.tx_bytes) : '--';
         var rx = c.rx_bytes != null ? fmtBytes(c.rx_bytes) : '--';
         var reqs = c.requests_served != null ? c.requests_served : '--';
@@ -795,7 +792,7 @@ body {
         return '<tr>' +
           '<td><span class="status-dot ' + (isOnline ? 'online' : 'offline') + '"></span></td>' +
           '<td class="client-id">' + escHtml(c.client_id || '--') + '</td>' +
-          '<td><div class="pool-bar-container"><div class="pool-bar"><div class="' + barClass + '" style="width:' + pct + '%"></div></div><span class="pool-text">' + poolReady + '/' + poolSize + '</span></div></td>' +
+          '<td>' + sessions + '</td>' +
           '<td>' + tx + '</td>' +
           '<td>' + rx + '</td>' +
           '<td>' + reqs + '</td>' +

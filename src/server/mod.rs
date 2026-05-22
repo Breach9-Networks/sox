@@ -295,9 +295,18 @@ pub async fn run_server(
     // Start tunnel listener
     let tunnel_cancel = shutdown.clone();
     let tunnel_router = router.clone();
+    let tunnel_max_streams = config.tunnel_max_streams;
+    let tunnel_recv_window_mb = config.tunnel_recv_window_mb;
     let tunnel_handle = tokio::spawn(async move {
-        if let Err(e) =
-            tunnel_listener::run_tunnel_listener(&tunnel_listen_addr, &secret, tunnel_router, tunnel_cancel).await
+        if let Err(e) = tunnel_listener::run_tunnel_listener(
+            &tunnel_listen_addr,
+            &secret,
+            tunnel_router,
+            tunnel_cancel,
+            tunnel_max_streams,
+            tunnel_recv_window_mb,
+        )
+        .await
         {
             tracing::error!(error = %e, "tunnel listener failed");
         }

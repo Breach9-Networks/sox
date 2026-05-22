@@ -78,9 +78,9 @@ enum Commands {
         #[arg(short = 'c', long)]
         config: Option<PathBuf>,
 
-        /// Shared secret for Noise Protocol encryption
+        /// Shared secret for Noise Protocol (or set [tunnel] secret in config)
         #[arg(long)]
-        secret: String,
+        secret: Option<String>,
 
         /// Add user credentials for SOCKS auth (format: user:pass, repeatable)
         #[arg(short, long = "user")]
@@ -109,17 +109,17 @@ enum Commands {
         #[arg(short = 'c', long)]
         config: Option<PathBuf>,
 
-        /// Shared secret (must match server)
+        /// Shared secret, must match server (or set [tunnel] secret in config)
         #[arg(long)]
-        secret: String,
+        secret: Option<String>,
 
         /// Unique client identifier
         #[arg(long, default_value = "default")]
         client_id: String,
 
-        /// Number of pre-established data connections
-        #[arg(long, default_value_t = 200)]
-        pool_size: u16,
+        /// Number of concurrent yamux sessions
+        #[arg(long, default_value_t = 8)]
+        tunnel_sessions: u16,
 
         /// Reconnect interval in seconds
         #[arg(long, default_value_t = 5)]
@@ -158,6 +158,21 @@ fn load_file_config(path: &Option<PathBuf>) -> Result<Option<FileConfig>, String
         Some(p) => FileConfig::load(p).map(Some),
         None => Ok(None),
     }
+}
+
+/// Resolve the tunnel secret from the CLI flag, falling back to `[tunnel] secret`
+/// in the config file.
+fn resolve_secret(cli: Option<String>, fc: Option<&FileConfig>) -> Result<String, String> {
+    if let Some(s) = cli {
+        return Ok(s);
+    }
+    if let Some(fc) = fc
+        && let Some(ref tunnel) = fc.tunnel
+        && let Some(ref s) = tunnel.secret
+    {
+        return Ok(s.clone());
+    }
+    Err("secret required: pass --secret or set [tunnel] secret in the config file".into())
 }
 
 #[tokio::main]
@@ -214,10 +229,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             init_tracing(&verbosity);
 
             let mut config = Config::default();
-
-            if let Some(file_config) = load_file_config(&config_path)? {
-                file_config.apply_to(&mut config);
+            let file_config = load_file_config(&config_path)?;
+            if let Some(ref fc) = file_config {
+                fc.apply_to(&mut config);
             }
+            let secret = resolve_secret(secret, file_config.as_ref())?;
 
             config.listen_addr = socks_listen;
             config.max_connections = max_connections;
@@ -238,7 +254,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             config: config_path,
             secret,
             client_id,
-            pool_size,
+            tunnel_sessions,
             reconnect_interval,
             verbosity,
         } => {
@@ -250,33 +266,46 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 std::process::exit(1);
             }
 
-            // Load file config for tunnel settings
             let file_config = load_file_config(&config_path)?;
+            let secret = resolve_secret(secret, file_config.as_ref())?;
 
             let mut cfg = ClientConfig {
                 server_addr,
                 secret,
                 client_id,
-                pool_size,
+                tunnel_sessions,
+                max_streams: 256,
+                recv_window_mb: 64,
                 reconnect_interval: std::time::Duration::from_secs(reconnect_interval),
+                reconnect_max: std::time::Duration::from_secs(60),
             };
 
-            // Override from TOML if present
-            if let Some(fc) = file_config
-                && let Some(ref tunnel) = fc.tunnel {
-                    if let Some(ref addr) = tunnel.server_addr {
-                        cfg.server_addr = addr.clone();
-                    }
-                    if let Some(ref id) = tunnel.client_id {
-                        cfg.client_id = id.clone();
-                    }
-                    if let Some(ps) = tunnel.pool_size {
-                        cfg.pool_size = ps;
-                    }
-                    if let Some(ri) = tunnel.reconnect_interval {
-                        cfg.reconnect_interval = std::time::Duration::from_secs(ri);
-                    }
+            // Override from TOML if present.
+            if let Some(ref fc) = file_config
+                && let Some(ref tunnel) = fc.tunnel
+            {
+                if let Some(ref addr) = tunnel.server_addr {
+                    cfg.server_addr = addr.clone();
                 }
+                if let Some(ref id) = tunnel.client_id {
+                    cfg.client_id = id.clone();
+                }
+                if let Some(v) = tunnel.tunnel_sessions {
+                    cfg.tunnel_sessions = v;
+                }
+                if let Some(v) = tunnel.max_streams_per_session {
+                    cfg.max_streams = v;
+                }
+                if let Some(v) = tunnel.recv_window_mb {
+                    cfg.recv_window_mb = v;
+                }
+                if let Some(v) = tunnel.reconnect_interval {
+                    cfg.reconnect_interval = std::time::Duration::from_secs(v);
+                }
+                if let Some(v) = tunnel.reconnect_max {
+                    cfg.reconnect_max = std::time::Duration::from_secs(v);
+                }
+            }
 
             let shutdown = CancellationToken::new();
             tokio::spawn(signal::shutdown_signal(shutdown.clone()));

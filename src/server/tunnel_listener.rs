@@ -1,34 +1,43 @@
-//! Listens for tunnel client connections using pool-based architecture.
+//! Listens for tunnel client connections — each connection becomes one yamux session.
 //!
-//! Each incoming TCP connection does a Noise handshake, then reads the first message:
-//! - Register -> control channel (heartbeat loop)
-//! - DataReady -> data channel (push to router, await assignment)
+//! Per connection: Noise handshake → `Hello`/`HelloAck` → register a `SessionHandle`
+//! with the `Router` → drive the yamux session until it ends.
 
 use std::sync::Arc;
 
 use tokio::net::TcpListener;
-use tokio::sync::Semaphore;
+use tokio::sync::{Semaphore, mpsc};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
 use crate::tunnel::noise::{NoiseStream, derive_psk};
-use crate::tunnel::protocol::TunnelMessage;
-use crate::tunnel::router::Router;
+use crate::tunnel::protocol::{Hello, HelloAck, PROTO_VERSION};
+use crate::tunnel::router::{Router, SessionHandle};
+use crate::tunnel::session::server_session_driver;
 
-/// Maximum concurrent tunnel connections (control + data channels).
+/// Maximum concurrent tunnel sessions.
 const MAX_TUNNEL_CONNECTIONS: usize = 2048;
+
+/// Buffer for pending "open outbound stream" requests per session.
+const OPEN_REQUEST_BUFFER: usize = 64;
 
 pub async fn run_tunnel_listener(
     listen_addr: &str,
     secret: &str,
     router: Arc<Router>,
     cancel: CancellationToken,
+    max_streams: usize,
+    recv_window_mb: usize,
 ) -> std::io::Result<()> {
     let listener = TcpListener::bind(listen_addr).await?;
     let psk = derive_psk(secret);
     let semaphore = Arc::new(Semaphore::new(MAX_TUNNEL_CONNECTIONS));
 
-    tracing::info!(%listen_addr, max_tunnel_conns = MAX_TUNNEL_CONNECTIONS, "tunnel listener started");
+    tracing::info!(
+        %listen_addr,
+        max_tunnel_conns = MAX_TUNNEL_CONNECTIONS,
+        "tunnel listener started"
+    );
 
     let mut tasks = JoinSet::new();
 
@@ -56,38 +65,11 @@ pub async fn run_tunnel_listener(
                 let cancel = cancel.clone();
 
                 tasks.spawn(async move {
-                    let _permit = permit; // held until task completes
-                    match NoiseStream::accept(stream, &psk).await {
-                        Ok(mut noise) => {
-                            // Read first message to determine channel type
-                            let data = match noise.recv().await {
-                                Ok(d) => d,
-                                Err(e) => {
-                                    tracing::debug!(%peer_addr, error = %e, "failed to read first message");
-                                    return;
-                                }
-                            };
-
-                            match TunnelMessage::decode(&data) {
-                                Ok(TunnelMessage::Register { client_id, pool_size }) => {
-                                    if let Err(e) = handle_control_channel(noise, &client_id, pool_size, &router, cancel).await {
-                                        tracing::debug!(%peer_addr, %client_id, error = %e, "control channel error");
-                                    }
-                                }
-                                Ok(TunnelMessage::DataReady { client_id }) => {
-                                    if let Err(e) = handle_data_channel(noise, &client_id, &router).await {
-                                        tracing::debug!(%peer_addr, %client_id, error = %e, "data channel error");
-                                    }
-                                }
-                                Ok(other) => {
-                                    tracing::debug!(%peer_addr, msg = ?other, "unexpected first message");
-                                }
-                                Err(e) => {
-                                    tracing::debug!(%peer_addr, error = %e, "failed to decode first message");
-                                }
-                            }
-                        }
-                        Err(e) => tracing::warn!(%peer_addr, error = %e, "noise handshake failed"),
+                    let _permit = permit;
+                    if let Err(e) = handle_tunnel_conn(
+                        stream, psk, router, cancel, max_streams, recv_window_mb,
+                    ).await {
+                        tracing::debug!(%peer_addr, error = %e, "tunnel session ended");
                     }
                 });
             }
@@ -98,75 +80,53 @@ pub async fn run_tunnel_listener(
     Ok(())
 }
 
-/// Handle a control channel: register client, run heartbeat loop.
-async fn handle_control_channel(
-    mut noise: NoiseStream,
-    client_id: &str,
-    pool_size: u16,
-    router: &Router,
+/// Handle one incoming tunnel connection: handshake, register, drive the session.
+async fn handle_tunnel_conn(
+    stream: tokio::net::TcpStream,
+    psk: [u8; 32],
+    router: Arc<Router>,
     cancel: CancellationToken,
+    max_streams: usize,
+    recv_window_mb: usize,
 ) -> std::io::Result<()> {
-    tracing::info!(%client_id, %pool_size, "client registered (pool)");
+    let mut noise = NoiseStream::accept(stream, &psk).await?;
 
-    let _data_tx = router.register(client_id.to_string(), pool_size).await;
+    // Read the client's Hello.
+    let hello_bytes = noise.recv().await?;
+    let hello = Hello::decode(&hello_bytes)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
 
-    let mut heartbeat_tick = tokio::time::interval(std::time::Duration::from_secs(15));
-    heartbeat_tick.tick().await;
-    let mut last_recv = tokio::time::Instant::now();
-    let deadline = std::time::Duration::from_secs(45);
+    if hello.proto_version != PROTO_VERSION {
+        let ack = HelloAck {
+            accepted: false,
+            reason: format!(
+                "proto version mismatch: server {PROTO_VERSION}, client {}",
+                hello.proto_version
+            ),
+        };
+        let _ = noise.send(&ack.encode()).await;
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "tunnel client proto version mismatch",
+        ));
+    }
 
-    let result = loop {
-        tokio::select! {
-            biased;
-            _ = cancel.cancelled() => {
-                let msg = TunnelMessage::Disconnect { reason: "server shutting down".into() };
-                let _ = noise.send(&msg.encode()).await;
-                break Ok(());
-            }
-            _ = heartbeat_tick.tick() => {
-                if last_recv.elapsed() > deadline {
-                    tracing::warn!(%client_id, "heartbeat timeout");
-                    break Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "heartbeat timeout"));
-                }
-                // Send heartbeat
-                let _ = noise.send(&TunnelMessage::Heartbeat.encode()).await;
-            }
-            result = noise.recv() => {
-                match result {
-                    Ok(data) => {
-                        last_recv = tokio::time::Instant::now();
-                        if let Ok(TunnelMessage::Disconnect { reason }) = TunnelMessage::decode(&data) {
-                            tracing::info!(%client_id, %reason, "client disconnected");
-                            break Ok(());
-                        }
-                        // Heartbeat response — already updated last_recv
-                    }
-                    Err(e) => {
-                        break Err(e);
-                    }
-                }
-            }
-        }
-    };
+    noise
+        .send(&HelloAck { accepted: true, reason: String::new() }.encode())
+        .await?;
 
-    router.unregister(client_id).await;
-    tracing::info!(%client_id, "client session ended");
+    let client_id = hello.client_id.clone();
+    tracing::info!(%client_id, session_index = hello.session_index, "tunnel session accepted");
 
-    result
-}
+    // Register a SessionHandle and drive the yamux session to completion.
+    let byte_stream = noise.into_byte_stream();
+    let (open_tx, open_rx) = mpsc::channel(OPEN_REQUEST_BUFFER);
+    let handle = SessionHandle::new(open_tx);
+    let session_id = handle.id;
+    router.register_session(client_id.clone(), handle).await;
 
-/// Handle a data channel: push to router, await assignment to keep alive.
-async fn handle_data_channel(
-    noise: NoiseStream,
-    client_id: &str,
-    router: &Router,
-) -> std::io::Result<()> {
-    // Push the noise stream to the router's pool for this client
-    let assign_rx = router.push_data_conn(client_id, noise).await?;
+    server_session_driver(byte_stream, open_rx, max_streams, recv_window_mb, cancel).await;
 
-    // Wait until the connection is assigned (taken by a SOCKS handler)
-    // This keeps this task alive so the underlying connection stays open
-    let _ = assign_rx.await;
-
+    router.remove_session(&client_id, session_id).await;
     Ok(())
 }

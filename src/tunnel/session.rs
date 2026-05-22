@@ -1,16 +1,25 @@
-//! yamux session 的建立、驅動與（client 端）連線池。
+//! yamux session 的建立與驅動。
+//!
+//! - Client 端：`SessionPool` 維護 N 條 session，接 server 開來的 inbound stream。
+//! - Server 端：`server_session_driver` 驅動一條 session，依請求開 outbound stream。
 
 use std::io;
 use std::time::{Duration, Instant};
 
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio_util::compat::TokioAsyncReadCompatExt;
+use tokio::sync::mpsc;
+use tokio_util::compat::{FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt};
 use tokio_util::sync::CancellationToken;
 use yamux::{Config, Connection, Mode, Stream};
 
+use crate::protocol::socks5::ReplyCode;
+use crate::relay::tcp::relay_bidirectional;
 use crate::tunnel::backoff::Backoff;
 use crate::tunnel::noise::{derive_psk, NoiseStream};
-use crate::tunnel::protocol::{Hello, HelloAck, PROTO_VERSION};
+use crate::tunnel::noise_stream::NoiseByteStream;
+use crate::tunnel::protocol::{Hello, HelloAck, StreamOpen, StreamReply, PROTO_VERSION};
+use crate::tunnel::router::StreamRequest;
 
 /// session 穩定存活超過此時間後，視為「健康」，重連退避歸零。
 const STABLE_AFTER: Duration = Duration::from_secs(30);
@@ -28,6 +37,8 @@ pub fn yamux_config(max_streams: usize, recv_window_mb: usize) -> Config {
     cfg.set_max_connection_receive_window(Some(requested.max(floor)));
     cfg
 }
+
+// ───────────────────────── Client 端 ─────────────────────────
 
 /// `SessionPool` 的可調參數。
 #[derive(Debug, Clone)]
@@ -102,7 +113,7 @@ async fn session_worker(
             return;
         }
         let started = Instant::now();
-        match run_session(
+        match run_client_session(
             index,
             &server_addr,
             &client_id,
@@ -133,11 +144,11 @@ async fn session_worker(
     }
 }
 
-/// 建立一條 session 並驅動其 yamux 連線，直到斷線或被取消。
+/// 建立一條 client 端 session 並驅動其 yamux 連線，直到斷線或被取消。
 ///
 /// 回傳 `Ok(())` 僅代表「乾淨取消」；任何其他結束（含對端關閉）回 `Err`，
 /// 讓 worker 重連。
-async fn run_session(
+async fn run_client_session(
     index: u16,
     server_addr: &str,
     client_id: &str,
@@ -183,7 +194,7 @@ async fn run_session(
         };
         match inbound {
             Some(Ok(stream)) => {
-                tokio::spawn(handle_inbound_stream(stream, cancel.clone()));
+                tokio::spawn(handle_inbound_stream(stream));
             }
             Some(Err(e)) => return Err(io::Error::other(format!("yamux: {e}"))),
             None => return Err(io::Error::other("session closed by peer")),
@@ -195,12 +206,118 @@ async fn run_session(
     Ok(())
 }
 
-/// 處理一條 server 開來的 inbound stream。
+/// 處理一條 server 開來的 inbound stream：讀 preamble → dial 目標 → relay。
+async fn handle_inbound_stream(stream: Stream) {
+    let mut io = stream.compat(); // futures -> tokio
+
+    let open = match read_stream_open(&mut io).await {
+        Ok(o) => o,
+        Err(e) => {
+            tracing::debug!(error = %e, "failed to read StreamOpen preamble");
+            return;
+        }
+    };
+
+    match open {
+        StreamOpen::Tcp { target } => {
+            match TcpStream::connect(&target).await {
+                Ok(mut target_stream) => {
+                    let _ = target_stream.set_nodelay(true);
+                    let bind = target_stream
+                        .local_addr()
+                        .map(|a| a.to_string())
+                        .unwrap_or_default();
+                    let reply = StreamReply { status: 0, message: bind };
+                    if io.write_all(&reply.encode()).await.is_err() {
+                        return;
+                    }
+                    tracing::debug!(%target, "tunnel TCP flow connected, relaying");
+                    let _ = relay_bidirectional(&mut io, &mut target_stream, None, None).await;
+                }
+                Err(e) => {
+                    tracing::debug!(%target, error = %e, "tunnel TCP connect failed");
+                    let reply = StreamReply {
+                        status: ReplyCode::for_connect_error(&e) as u8,
+                        message: e.to_string(),
+                    };
+                    let _ = io.write_all(&reply.encode()).await;
+                }
+            }
+        }
+        StreamOpen::Udp => {
+            // Task 16 會實作 UDP-over-tunnel；目前回報尚未支援。
+            let reply = StreamReply {
+                status: ReplyCode::CommandNotSupported as u8,
+                message: "UDP over tunnel not yet supported".into(),
+            };
+            let _ = io.write_all(&reply.encode()).await;
+        }
+    }
+}
+
+/// 從 stream 開頭精確讀出 `StreamOpen` preamble（自帶長度，不會超讀）。
+async fn read_stream_open<S>(s: &mut S) -> io::Result<StreamOpen>
+where
+    S: tokio::io::AsyncRead + Unpin,
+{
+    let mut kind = [0u8; 1];
+    s.read_exact(&mut kind).await?;
+    match kind[0] {
+        0x01 => {
+            let mut len = [0u8; 2];
+            s.read_exact(&mut len).await?;
+            let n = u16::from_be_bytes(len) as usize;
+            let mut target = vec![0u8; n];
+            s.read_exact(&mut target).await?;
+            Ok(StreamOpen::Tcp {
+                target: String::from_utf8_lossy(&target).into_owned(),
+            })
+        }
+        0x02 => Ok(StreamOpen::Udp),
+        other => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unknown StreamOpen kind {other:#x}"),
+        )),
+    }
+}
+
+// ───────────────────────── Server 端 ─────────────────────────
+
+/// 驅動一條 server 端 yamux session。
 ///
-/// Task 13 會以「讀 preamble → dial 目標 → relay」取代此 stub。
-async fn handle_inbound_stream(stream: Stream, _cancel: CancellationToken) {
-    // stub：尚未實作 → 讓 stream 在函式結束時 drop（等同 reset）。
-    let _ = stream;
+/// 擁有 `Connection`，從 `open_rx` 收「開 outbound stream」請求 → `poll_new_outbound`；
+/// 同時持續 poll `poll_next_inbound` 驅動連線（server 不預期 inbound stream）。
+pub async fn server_session_driver(
+    byte_stream: NoiseByteStream,
+    mut open_rx: mpsc::Receiver<StreamRequest>,
+    max_streams: usize,
+    recv_window_mb: usize,
+    cancel: CancellationToken,
+) {
+    let compat = byte_stream.compat();
+    let mut conn = Connection::new(compat, yamux_config(max_streams, recv_window_mb), Mode::Server);
+
+    loop {
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => break,
+            req = open_rx.recv() => {
+                let Some(reply) = req else { break }; // 所有 SessionHandle 已 drop
+                let result = std::future::poll_fn(|cx| conn.poll_new_outbound(cx))
+                    .await
+                    .map_err(|e| io::Error::other(format!("yamux open: {e}")));
+                let _ = reply.send(result);
+            }
+            inbound = std::future::poll_fn(|cx| conn.poll_next_inbound(cx)) => {
+                match inbound {
+                    Some(Ok(s)) => drop(s), // server 不預期 inbound stream
+                    Some(Err(_)) | None => break,
+                }
+            }
+        }
+    }
+
+    let _ = std::future::poll_fn(|cx| conn.poll_close(cx)).await;
 }
 
 #[cfg(test)]

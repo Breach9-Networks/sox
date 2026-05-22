@@ -5,8 +5,6 @@ use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-use crate::tunnel::noise::{NoiseSender, NoiseReceiver};
-
 /// Bidirectional TCP relay with explicit half-close handling
 /// and live byte counting.
 ///
@@ -78,101 +76,6 @@ pub async fn relay_tcp_live(
     Ok((tx, rx))
 }
 
-/// Bidirectional relay through a Noise tunnel using framed messages.
-///
-/// `sender`/`receiver` are the split halves of the tunnel NoiseStream.
-/// `local` is the local TCP stream (SOCKS client on server side, target on client side).
-///
-/// "tx" = local → tunnel, "rx" = tunnel → local.
-pub async fn relay_tunneled(
-    sender: &mut NoiseSender,
-    receiver: &mut NoiseReceiver,
-    local: &mut TcpStream,
-    live_tx: Option<&AtomicU64>,
-    live_rx: Option<&AtomicU64>,
-) -> io::Result<(u64, u64)> {
-    let (mut local_reader, mut local_writer) = local.split();
-
-    let tx_total = Arc::new(AtomicU64::new(0));
-    let rx_total = Arc::new(AtomicU64::new(0));
-    let tx_total_c = tx_total.clone();
-    let rx_total_c = rx_total.clone();
-
-    // local → tunnel: read from local, send as RelayData through Noise
-    // Pre-allocate send buffer: [type_byte | data]. Avoids per-chunk Vec allocation.
-    let local_to_tunnel = async {
-        let mut buf = [0u8; 1 + 16384]; // type byte + data
-        buf[0] = 0x10; // MessageType::RelayData
-        loop {
-            let n = local_reader.read(&mut buf[1..]).await?;
-            if n == 0 {
-                // Local side EOF — send RelayEnd
-                sender.send(&[0x11]).await?; // MessageType::RelayEnd
-                break;
-            }
-            sender.send(&buf[..1 + n]).await?;
-            tx_total_c.fetch_add(n as u64, Ordering::Relaxed);
-            if let Some(counter) = live_tx {
-                counter.fetch_add(n as u64, Ordering::Relaxed);
-            }
-        }
-        Ok::<(), io::Error>(())
-    };
-
-    // tunnel → local: receive from Noise, write to local
-    let tunnel_to_local = async {
-        loop {
-            let plaintext = receiver.recv().await?;
-            if plaintext.is_empty() {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "empty tunnel message"));
-            }
-            match plaintext[0] {
-                0x10 => { // RelayData
-                    let data = &plaintext[1..];
-                    if data.is_empty() {
-                        continue;
-                    }
-                    local_writer.write_all(data).await?;
-                    rx_total_c.fetch_add(data.len() as u64, Ordering::Relaxed);
-                    if let Some(counter) = live_rx {
-                        counter.fetch_add(data.len() as u64, Ordering::Relaxed);
-                    }
-                }
-                0x11 => { // RelayEnd
-                    local_writer.shutdown().await?;
-                    break;
-                }
-                other => {
-                    tracing::warn!(msg_type = other, "unexpected message during relay");
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("unexpected message type during relay: {other:#x}"),
-                    ));
-                }
-            }
-        }
-        Ok::<(), io::Error>(())
-    };
-
-    // Use join! (not try_join!) so both directions run to completion.
-    // try_join! cancels the surviving future mid-operation, which can leave
-    // a Noise frame half-written and permanently corrupt the stream.
-    // This is critical for WebSocket and other long-lived connections where
-    // one side closing normally causes a write error on the other side.
-    let (r1, r2) = tokio::join!(local_to_tunnel, tunnel_to_local);
-
-    if let Err(e) = &r1 {
-        tracing::trace!(error = %e, "relay local→tunnel ended with error");
-    }
-    if let Err(e) = &r2 {
-        tracing::trace!(error = %e, "relay tunnel→local ended with error");
-    }
-
-    let tx = tx_total.load(Ordering::Relaxed);
-    let rx = rx_total.load(Ordering::Relaxed);
-    Ok((tx, rx))
-}
-
 /// 在任兩個雙向串流間 relay，附 live byte 計數。
 /// 回傳 `(a→b bytes, b→a bytes)`。
 ///
@@ -236,7 +139,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::io::{duplex, AsyncReadExt as _, AsyncWriteExt as _};
+    use tokio::io::duplex;
 
     #[tokio::test]
     async fn relay_copies_both_directions() {

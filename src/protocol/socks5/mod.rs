@@ -57,3 +57,31 @@ pub enum ReplyCode {
     CommandNotSupported = 0x07,
     AddressTypeNotSupported = 0x08,
 }
+
+impl ReplyCode {
+    /// Map a reply-code byte back to a `ReplyCode` (used by the tunnel
+    /// `StreamReply.status` field). Unknown values fall back to GeneralFailure.
+    pub fn from_u8(b: u8) -> ReplyCode {
+        match b {
+            0x00 => ReplyCode::Succeeded,
+            0x02 => ReplyCode::ConnectionNotAllowed,
+            0x03 => ReplyCode::NetworkUnreachable,
+            0x04 => ReplyCode::HostUnreachable,
+            0x05 => ReplyCode::ConnectionRefused,
+            0x06 => ReplyCode::TtlExpired,
+            0x07 => ReplyCode::CommandNotSupported,
+            0x08 => ReplyCode::AddressTypeNotSupported,
+            _ => ReplyCode::GeneralFailure,
+        }
+    }
+
+    /// Classify a connect() error into the closest SOCKS5 reply code.
+    pub fn for_connect_error(e: &std::io::Error) -> ReplyCode {
+        match e.kind() {
+            std::io::ErrorKind::ConnectionRefused => ReplyCode::ConnectionRefused,
+            std::io::ErrorKind::AddrNotAvailable => ReplyCode::HostUnreachable,
+            std::io::ErrorKind::TimedOut => ReplyCode::TtlExpired,
+            _ => ReplyCode::GeneralFailure,
+        }
+    }
+}

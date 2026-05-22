@@ -54,6 +54,12 @@ pub struct Config {
 
     /// Monitor dashboard HTTP address. None = disabled.
     pub monitor_addr: Option<std::net::SocketAddr>,
+
+    /// Tunnel mode: per-session yamux stream limit.
+    pub tunnel_max_streams: usize,
+
+    /// Tunnel mode: per-session yamux receive window (MiB).
+    pub tunnel_recv_window_mb: usize,
 }
 
 impl Default for Config {
@@ -72,6 +78,8 @@ impl Default for Config {
             tcp_keepalive_interval: Duration::from_secs(10),
             tcp_keepalive_probes: 3,
             monitor_addr: None,
+            tunnel_max_streams: 256,
+            tunnel_recv_window_mb: 64,
         }
     }
 }
@@ -111,8 +119,16 @@ pub struct FileTunnelConfig {
     pub secret: Option<String>,
     pub server_addr: Option<String>,
     pub client_id: Option<String>,
-    pub pool_size: Option<u16>,
+    /// Number of concurrent yamux sessions (client side).
+    pub tunnel_sessions: Option<u16>,
+    /// Per-session yamux stream limit (both sides).
+    pub max_streams_per_session: Option<usize>,
+    /// Per-session yamux receive window in MiB (both sides).
+    pub recv_window_mb: Option<usize>,
+    /// Reconnect backoff base, seconds.
     pub reconnect_interval: Option<u64>,
+    /// Reconnect backoff cap, seconds.
+    pub reconnect_max: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -178,6 +194,16 @@ impl FileConfig {
             }
             if let Some(v) = ka.probes {
                 config.tcp_keepalive_probes = v;
+            }
+        }
+
+        // Server-side tunnel yamux settings.
+        if let Some(ref tunnel) = self.tunnel {
+            if let Some(v) = tunnel.max_streams_per_session {
+                config.tunnel_max_streams = v;
+            }
+            if let Some(v) = tunnel.recv_window_mb {
+                config.tunnel_recv_window_mb = v;
             }
         }
     }
