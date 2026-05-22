@@ -137,7 +137,7 @@ pub async fn run_standalone(
                 tasks.spawn(async move {
                     let _permit = permit;
                     let _ip_guard = ip_guard;
-                    ctx.metrics.connection_opened();
+                    let _conn = ctx.metrics.connection_opened();
                     ctx.extended_metrics.record_connection();
                     ctx.extended_metrics.record_ip_connect(peer_addr.ip());
 
@@ -157,7 +157,7 @@ pub async fn run_standalone(
                     }
 
                     ctx.extended_metrics.record_ip_disconnect(peer_addr.ip());
-                    ctx.metrics.connection_closed();
+                    // active count is decremented by the `_conn` guard on drop.
                 });
             }
         }
@@ -341,7 +341,7 @@ pub async fn run_server(
                 tasks.spawn(async move {
                     let _permit = permit;
                     let _ip_guard = ip_guard;
-                    ctx.metrics.connection_opened();
+                    let _conn = ctx.metrics.connection_opened();
                     ctx.extended_metrics.record_connection();
                     ctx.extended_metrics.record_ip_connect(peer_addr.ip());
 
@@ -361,7 +361,7 @@ pub async fn run_server(
                     }
 
                     ctx.extended_metrics.record_ip_disconnect(peer_addr.ip());
-                    ctx.metrics.connection_closed();
+                    // active count is decremented by the `_conn` guard on drop.
                 });
             }
         }
