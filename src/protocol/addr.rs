@@ -115,6 +115,14 @@ impl TargetAddr {
             0,
         )))
     }
+
+    /// The port component of this address.
+    pub fn port(&self) -> u16 {
+        match self {
+            TargetAddr::Ip(addr) => addr.port(),
+            TargetAddr::Domain(_, port) => *port,
+        }
+    }
 }
 
 #[cfg(test)]

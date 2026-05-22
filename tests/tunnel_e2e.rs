@@ -418,6 +418,90 @@ async fn socks5_command_request_arriving_fragmented() {
     cancel.cancel();
 }
 
+/// A UDP ASSOCIATE that only carries DNS traffic (datagrams to port 53) is
+/// closed early once idle, instead of being held for the full idle timeout.
+#[tokio::test]
+async fn udp_dns_association_closes_early() {
+    let (socks_port, _) = two_free_ports().await;
+    let proxy: SocketAddr = format!("127.0.0.1:{socks_port}").parse().unwrap();
+    let cancel = CancellationToken::new();
+    start_standalone(socks_port, cancel.clone());
+    wait_for_listener(proxy).await;
+
+    let mut ctrl = TcpStream::connect(proxy).await.unwrap();
+    ctrl.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+    let mut greeting = [0u8; 2];
+    ctrl.read_exact(&mut greeting).await.unwrap();
+    ctrl.write_all(&[0x05, 0x03, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+        .await
+        .unwrap();
+    let mut reply = [0u8; 10];
+    ctrl.read_exact(&mut reply).await.unwrap();
+    let relay_port = u16::from_be_bytes([reply[8], reply[9]]);
+    let relay_addr: SocketAddr = format!("127.0.0.1:{relay_port}").parse().unwrap();
+
+    // One datagram destined for port 53 (0x0035) — marks it as a DNS flow.
+    let client_udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let mut pkt = vec![0x00, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0x00, 0x35];
+    pkt.extend_from_slice(b"dns-query");
+    client_udp.send_to(&pkt, relay_addr).await.unwrap();
+
+    // The DNS-only association should be closed by the server once idle —
+    // observed as EOF (or reset) on the control connection.
+    let observed = tokio::time::timeout(Duration::from_secs(8), async {
+        let mut buf = [0u8; 1];
+        ctrl.read(&mut buf).await
+    })
+    .await;
+    cancel.cancel();
+
+    match observed {
+        Ok(Ok(0)) | Ok(Err(_)) => {} // server closed the idle DNS association
+        Ok(Ok(n)) => panic!("unexpected {n} bytes on the control connection"),
+        Err(_) => panic!("DNS-only UDP association was not closed early"),
+    }
+}
+
+/// A UDP ASSOCIATE carrying non-DNS traffic is NOT closed early.
+#[tokio::test]
+async fn udp_non_dns_association_stays_open() {
+    let (socks_port, _) = two_free_ports().await;
+    let proxy: SocketAddr = format!("127.0.0.1:{socks_port}").parse().unwrap();
+    let cancel = CancellationToken::new();
+    start_standalone(socks_port, cancel.clone());
+    wait_for_listener(proxy).await;
+
+    let mut ctrl = TcpStream::connect(proxy).await.unwrap();
+    ctrl.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+    let mut greeting = [0u8; 2];
+    ctrl.read_exact(&mut greeting).await.unwrap();
+    ctrl.write_all(&[0x05, 0x03, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+        .await
+        .unwrap();
+    let mut reply = [0u8; 10];
+    ctrl.read_exact(&mut reply).await.unwrap();
+    let relay_port = u16::from_be_bytes([reply[8], reply[9]]);
+    let relay_addr: SocketAddr = format!("127.0.0.1:{relay_port}").parse().unwrap();
+
+    // A datagram destined for a non-DNS port (0x3039 = 12345).
+    let client_udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let mut pkt = vec![0x00, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0x30, 0x39];
+    pkt.extend_from_slice(b"not-dns");
+    client_udp.send_to(&pkt, relay_addr).await.unwrap();
+
+    let observed = tokio::time::timeout(Duration::from_secs(8), async {
+        let mut buf = [0u8; 1];
+        ctrl.read(&mut buf).await
+    })
+    .await;
+    cancel.cancel();
+
+    assert!(
+        observed.is_err(),
+        "non-DNS UDP association should not be closed early"
+    );
+}
+
 /// A RFC 1929 username/password request that arrives split across two TCP
 /// segments must still be parsed correctly.
 #[tokio::test]

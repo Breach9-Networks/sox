@@ -2,6 +2,8 @@ use std::collections::HashMap;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
@@ -10,6 +12,63 @@ use tokio_util::sync::CancellationToken;
 use crate::protocol::addr::TargetAddr;
 use crate::protocol::socks5::udp::{parse_udp_header, write_udp_header, UdpHeader};
 use crate::tunnel::protocol::UdpDatagram;
+
+/// Standard DNS port. UDP flows whose peer port is 53 are treated as DNS.
+const DNS_PORT: u16 = 53;
+
+/// A UDP association that has only ever carried DNS traffic is closed this
+/// long after its last datagram — DNS is request/response and short-lived,
+/// so there is no need to hold the association for the full idle timeout.
+const DNS_IDLE: Duration = Duration::from_secs(3);
+
+/// Tracks one UDP association's activity, for the DNS-aware early close.
+struct UdpActivity {
+    last: std::sync::Mutex<Instant>,
+    /// Cleared once any non-DNS datagram (peer port != 53) is seen.
+    dns_only: AtomicBool,
+    /// Set once any datagram is seen.
+    seen: AtomicBool,
+}
+
+impl UdpActivity {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            last: std::sync::Mutex::new(Instant::now()),
+            dns_only: AtomicBool::new(true),
+            seen: AtomicBool::new(false),
+        })
+    }
+
+    /// Record a datagram; `peer_port` is the port of the datagram's peer
+    /// (destination for client→target, source for target→client).
+    fn touch(&self, peer_port: u16) {
+        *self.last.lock().unwrap() = Instant::now();
+        self.seen.store(true, Ordering::Relaxed);
+        if peer_port != DNS_PORT {
+            self.dns_only.store(false, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Watch a UDP association: if it has only carried DNS and has been idle
+/// longer than `DNS_IDLE`, cancel it early.
+async fn dns_idle_watcher(activity: Arc<UdpActivity>, cancel: CancellationToken) {
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => return,
+            _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+        }
+        let idle = activity.last.lock().unwrap().elapsed();
+        if activity.seen.load(Ordering::Relaxed)
+            && activity.dns_only.load(Ordering::Relaxed)
+            && idle > DNS_IDLE
+        {
+            tracing::debug!("DNS-only UDP association idle, closing early");
+            cancel.cancel();
+            return;
+        }
+    }
+}
 
 /// Run a UDP relay for a SOCKS5 UDP ASSOCIATE session.
 ///
@@ -42,17 +101,19 @@ pub async fn relay_udp(
     let cancel_tcp = cancel.clone();
     let tcp_monitor = tokio::spawn(async move {
         let mut buf = [0u8; 1];
-        // When TCP stream closes or errors, cancel everything
-        let _ = tcp_control.readable().await;
-        // Try to read — EOF means client disconnected
-        match tcp_control.try_read(&mut buf) {
-            Ok(0) | Err(_) => {}
-            Ok(_) => {
-                // Unexpected data on control stream, ignore
-            }
+        // End on TCP closure/error, or when the relay is cancelled elsewhere.
+        tokio::select! {
+            _ = cancel_tcp.cancelled() => return,
+            r = tcp_control.readable() => { let _ = r; }
         }
+        let _ = tcp_control.try_read(&mut buf);
         cancel_tcp.cancel();
     });
+
+    // DNS-aware lifecycle: a UDP association carrying only DNS traffic is
+    // closed early once idle, instead of being held for the full idle timeout.
+    let activity = UdpActivity::new();
+    let watcher = tokio::spawn(dns_idle_watcher(activity.clone(), cancel.clone()));
 
     // Task 2: Client → Target relay
     let relay_c2t = relay_socket.clone();
@@ -61,6 +122,7 @@ pub async fn relay_udp(
     let relay_fwd = relay_socket.clone();
     let targets_fwd = target_sockets.clone();
     let learned_c2t = learned_client.clone();
+    let activity_c2t = activity.clone();
 
     let client_to_target = tokio::spawn(async move {
         let mut buf = vec![0u8; 65535];
@@ -100,6 +162,9 @@ pub async fn relay_udp(
                         continue;
                     }
 
+                    // Record activity for the DNS-aware idle watcher.
+                    activity_c2t.touch(header.target.port());
+
                     let payload = &buf[payload_offset..n];
 
                     // Resolve target
@@ -131,6 +196,7 @@ pub async fn relay_udp(
                             let sock_back = sock.clone();
                             let cancel_back = cancel_c2t.clone();
                             let learned_back = learned_c2t.clone();
+                            let activity_back = activity_c2t.clone();
                             let target_for_header = header.target.clone();
 
                             tokio::spawn(async move {
@@ -138,6 +204,7 @@ pub async fn relay_udp(
                                     sock_back,
                                     relay_back,
                                     learned_back,
+                                    activity_back,
                                     target_for_header,
                                     cancel_back,
                                 )
@@ -159,6 +226,7 @@ pub async fn relay_udp(
 
     // Wait for cancellation or completion
     let _ = tokio::join!(tcp_monitor, client_to_target);
+    watcher.abort();
 
     // Clean up target sockets
     let mut targets = targets_fwd.lock().await;
@@ -172,6 +240,7 @@ async fn target_to_client(
     target_socket: std::sync::Arc<UdpSocket>,
     relay_socket: std::sync::Arc<UdpSocket>,
     learned_client: Arc<std::sync::Mutex<Option<SocketAddr>>>,
+    activity: Arc<UdpActivity>,
     target_addr: TargetAddr,
     cancel: CancellationToken,
 ) {
@@ -186,6 +255,9 @@ async fn target_to_client(
                     Ok(v) => v,
                     Err(_) => break,
                 };
+
+                // Record activity for the DNS-aware idle watcher.
+                activity.touch(target_addr.port());
 
                 // The client address is known only after its first packet.
                 let Some(client_addr) = *learned_client.lock().unwrap() else {
@@ -267,22 +339,30 @@ where
     // 從首個封包學到的 SOCKS client UDP 位址（兩個方向共用）。
     let client_addr: Arc<std::sync::Mutex<Option<SocketAddr>>> =
         Arc::new(std::sync::Mutex::new(None));
+    let activity = UdpActivity::new();
 
     // TCP 控制通道關閉 → 取消整個 relay。
     let cancel_tcp = cancel.clone();
     let tcp_monitor = tokio::spawn(async move {
         let mut b = [0u8; 1];
-        let _ = tcp_control.readable().await;
+        tokio::select! {
+            _ = cancel_tcp.cancelled() => return,
+            r = tcp_control.readable() => { let _ = r; }
+        }
         let _ = tcp_control.try_read(&mut b);
         cancel_tcp.cancel();
     });
 
+    // DNS-aware lifecycle — close a DNS-only association early once idle.
+    let watcher = tokio::spawn(dns_idle_watcher(activity.clone(), cancel.clone()));
+
     tokio::select! {
         _ = cancel.cancelled() => {}
-        _ = udp_c2t(sock.clone(), peer_ip, client_addr.clone(), sw) => {}
-        _ = udp_t2c(sock, client_addr, sr) => {}
+        _ = udp_c2t(sock.clone(), peer_ip, client_addr.clone(), sw, activity.clone()) => {}
+        _ = udp_t2c(sock, client_addr, sr, activity) => {}
     }
     tcp_monitor.abort();
+    watcher.abort();
     Ok(())
 }
 
@@ -292,6 +372,7 @@ async fn udp_c2t<W>(
     peer_ip: IpAddr,
     client_addr: Arc<std::sync::Mutex<Option<SocketAddr>>>,
     mut sw: W,
+    activity: Arc<UdpActivity>,
 ) -> io::Result<()>
 where
     W: AsyncWrite + Unpin,
@@ -310,6 +391,7 @@ where
         if header.frag != 0 {
             continue; // 不支援分片
         }
+        activity.touch(header.target.port());
         let dat = UdpDatagram {
             addr: header.target,
             payload: buf[off..n].to_vec(),
@@ -323,12 +405,14 @@ async fn udp_t2c<R>(
     sock: Arc<UdpSocket>,
     client_addr: Arc<std::sync::Mutex<Option<SocketAddr>>>,
     mut sr: R,
+    activity: Arc<UdpActivity>,
 ) -> io::Result<()>
 where
     R: AsyncRead + Unpin,
 {
     loop {
         let dat = read_udp_datagram(&mut sr).await?;
+        activity.touch(dat.addr.port());
         let dest = match *client_addr.lock().unwrap() {
             Some(a) => a,
             None => continue, // 還沒看過 client 封包，無處可回
