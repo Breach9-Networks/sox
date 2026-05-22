@@ -45,11 +45,16 @@
   丟光所有 datagram —— 改為依 IP 過濾、從首包動態學 client 位址。
 - SOCKS5 command / RFC 1929 auth request 用單次 `read()`，分片到達時解析
   失敗、連線被丟 —— 改為讀到 parser 回報完整為止。
-- 新增三個重現測試（standalone UDP、command 分片、auth 分片）。共 61 測試。
+- 新增重現測試（standalone UDP、command 分片、auth 分片）。
+
+**已完成（TrustTunnel 借鏡）**
+
+- DNS-aware UDP 生命週期：只跑 DNS 的 UDP 關聯閒置 3s 即提早關閉，不再佔住
+  yamux stream／socket 到 idle timeout。`relay_udp` 與 `relay_udp_tunneled`
+  皆已接上，共 63 測試。
 
 **待辦（TrustTunnel 可再借鏡，依優先序）**
 
-- DNS-aware UDP 生命週期：port 53 追蹤 pending query 數，回完即關。
 - Lazy 連線限制 acquire：限制「已認證」連線而非 idle TCP accept。
 - Graceful shutdown completion barrier：tunnel 側等 in-flight relay 收尾再關。
 - RAII metrics guard：active 計數綁物件生命週期，防 panic 路徑洩漏。
