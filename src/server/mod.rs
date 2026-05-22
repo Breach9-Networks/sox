@@ -142,7 +142,6 @@ pub async fn run_standalone(
                 };
 
                 let ctx = ctx.clone();
-                let shutdown = shutdown.clone();
 
                 tasks.spawn(async move {
                     let _permit = permit;
@@ -154,7 +153,7 @@ pub async fn run_standalone(
                     let active = ctx.metrics.active_connections.load(std::sync::atomic::Ordering::Relaxed);
                     ctx.extended_metrics.update_peak(active);
 
-                    let (authed_user, result) = handle_client(stream, peer_addr, &ctx, shutdown).await;
+                    let (authed_user, result) = handle_client(stream, peer_addr, &ctx).await;
 
                     if let Some(ref user) = authed_user {
                         ctx.extended_metrics.record_user_connect(user);
@@ -204,7 +203,6 @@ async fn handle_client(
     stream: tokio::net::TcpStream,
     peer_addr: SocketAddr,
     ctx: &ServerContext,
-    shutdown: CancellationToken,
 ) -> (Option<String>, Result<(), crate::error::ServerError>) {
     tracing::debug!(%peer_addr, "new connection");
 
@@ -215,16 +213,11 @@ async fn handle_client(
 
     let mut stream = stream;
 
-    let (authed_user, result) = tokio::select! {
-        biased;
-        _ = shutdown.cancelled() => {
-            tracing::debug!(%peer_addr, "connection cancelled by shutdown");
-            (None, Ok(()))
-        }
-        result = connection::handle_connection(&mut stream, peer_addr, ctx) => {
-            result
-        }
-    };
+    // Run to completion. Graceful shutdown is handled by the accept loop
+    // halting and the JoinSet drain bounding in-flight connections — not by
+    // abandoning a relay mid-flight.
+    let (authed_user, result) =
+        connection::handle_connection(&mut stream, peer_addr, ctx).await;
 
     // Return the authenticated username for the caller to track
     if let Some(ref user) = authed_user {
@@ -302,8 +295,10 @@ pub async fn run_server(
 
     spawn_traffic_sampler(ctx.clone(), shutdown.clone());
 
-    // Start tunnel listener
-    let tunnel_cancel = shutdown.clone();
+    // Start tunnel listener. It runs on its own cancellation token so it can
+    // outlive the SOCKS-connection drain during shutdown.
+    let tunnel_cancel = CancellationToken::new();
+    let listener_cancel = tunnel_cancel.clone();
     let tunnel_router = router.clone();
     let tunnel_max_streams = config.tunnel_max_streams;
     let tunnel_recv_window_mb = config.tunnel_recv_window_mb;
@@ -312,7 +307,7 @@ pub async fn run_server(
             &tunnel_listen_addr,
             &secret,
             tunnel_router,
-            tunnel_cancel,
+            listener_cancel,
             tunnel_max_streams,
             tunnel_recv_window_mb,
         )
@@ -356,7 +351,6 @@ pub async fn run_server(
                 };
 
                 let ctx = ctx.clone();
-                let shutdown = shutdown.clone();
 
                 tasks.spawn(async move {
                     let _permit = permit;
@@ -368,7 +362,7 @@ pub async fn run_server(
                     let active = ctx.metrics.active_connections.load(std::sync::atomic::Ordering::Relaxed);
                     ctx.extended_metrics.update_peak(active);
 
-                    let (authed_user, result) = handle_client(stream, peer_addr, &ctx, shutdown).await;
+                    let (authed_user, result) = handle_client(stream, peer_addr, &ctx).await;
 
                     if let Some(ref user) = authed_user {
                         ctx.extended_metrics.record_user_connect(user);
@@ -387,6 +381,31 @@ pub async fn run_server(
         }
     }
 
+    // Drain in-flight SOCKS connections (bounded by drain_timeout) before
+    // stopping the tunnel — relays keep their tunnel sessions alive while
+    // they finish.
+    let drain_deadline = tokio::time::sleep(ctx.config.drain_timeout);
+    tokio::pin!(drain_deadline);
+    loop {
+        if tasks.is_empty() {
+            tracing::info!("all connections drained");
+            break;
+        }
+        tokio::select! {
+            _ = tasks.join_next() => {}
+            _ = &mut drain_deadline => {
+                tracing::warn!(
+                    remaining = tasks.len(),
+                    "drain timeout, aborting remaining connections"
+                );
+                tasks.abort_all();
+                break;
+            }
+        }
+    }
+
+    // SOCKS connections drained — now stop the tunnel sessions.
+    tunnel_cancel.cancel();
     tunnel_handle.abort();
 
     let snap = ctx.metrics.snapshot();

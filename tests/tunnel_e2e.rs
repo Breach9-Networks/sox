@@ -418,6 +418,45 @@ async fn socks5_command_request_arriving_fragmented() {
     cancel.cancel();
 }
 
+/// A relay already in progress when shutdown is signalled must be drained to
+/// completion, not cut instantly.
+#[tokio::test]
+async fn shutdown_drains_in_flight_relay() {
+    // Target: on connect, wait a beat, then send a payload and close. The
+    // payload is sent *after* shutdown is signalled below.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let target = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        if let Ok((mut sock, _)) = listener.accept().await {
+            tokio::time::sleep(Duration::from_millis(800)).await;
+            let _ = sock.write_all(b"survived-shutdown").await;
+            let _ = sock.shutdown().await;
+        }
+    });
+
+    let (socks_port, _) = two_free_ports().await;
+    let proxy: SocketAddr = format!("127.0.0.1:{socks_port}").parse().unwrap();
+    let cancel = CancellationToken::new();
+    start_standalone(socks_port, cancel.clone());
+    wait_for_listener(proxy).await;
+
+    // Establish the relay, then signal shutdown while the target is still
+    // sleeping — the payload has not been sent yet.
+    let mut conn = socks5_connect(proxy, target).await.unwrap();
+    cancel.cancel();
+
+    // The in-flight relay must still deliver the payload.
+    let got = tokio::time::timeout(Duration::from_secs(10), async {
+        let mut buf = Vec::new();
+        conn.read_to_end(&mut buf).await.unwrap();
+        buf
+    })
+    .await
+    .expect("relay did not finish after shutdown");
+
+    assert_eq!(&got, b"survived-shutdown", "in-flight relay was cut by shutdown");
+}
+
 /// A UDP ASSOCIATE that only carries DNS traffic (datagrams to port 53) is
 /// closed early once idle, instead of being held for the full idle timeout.
 #[tokio::test]
