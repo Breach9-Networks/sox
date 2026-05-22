@@ -106,6 +106,38 @@ fn start_client(
     tokio::spawn(sox::client::run_client(cfg, cancel));
 }
 
+fn start_standalone(socks_port: u16, cancel: CancellationToken) {
+    let config = sox::config::Config {
+        listen_addr: format!("127.0.0.1:{socks_port}").parse().unwrap(),
+        ..sox::config::Config::default()
+    };
+    tokio::spawn(async move {
+        let _ = sox::server::run_standalone(config, cancel).await;
+    });
+}
+
+fn start_standalone_with_auth(socks_port: u16, user: &str, pass: &str, cancel: CancellationToken) {
+    let config = sox::config::Config {
+        listen_addr: format!("127.0.0.1:{socks_port}").parse().unwrap(),
+        auth: sox::config::AuthConfig::Password(vec![(user.to_string(), pass.to_string())]),
+        ..sox::config::Config::default()
+    };
+    tokio::spawn(async move {
+        let _ = sox::server::run_standalone(config, cancel).await;
+    });
+}
+
+/// Wait until something is accepting TCP connections at `addr`.
+async fn wait_for_listener(addr: SocketAddr) {
+    for _ in 0..50 {
+        if TcpStream::connect(addr).await.is_ok() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("listener at {addr} never came up");
+}
+
 /// Stand up a full server + client tunnel; returns the SOCKS proxy address
 /// and a cancel token that shuts both down.
 async fn spawn_tunnel(
@@ -160,6 +192,57 @@ async fn retry_connect(proxy: SocketAddr, target: SocketAddr) -> TcpStream {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     panic!("tunnel did not become ready within 5s");
+}
+
+/// Run a SOCKS5 UDP ASSOCIATE through `proxy`, send `payload` to `target` via
+/// the relay socket, and return the echoed datagram (SOCKS5 UDP header still
+/// attached) if one comes back.
+async fn udp_associate_echo(
+    proxy: SocketAddr,
+    target: SocketAddr,
+    payload: &[u8],
+) -> Option<Vec<u8>> {
+    let mut ctrl = TcpStream::connect(proxy).await.ok()?;
+    ctrl.write_all(&[0x05, 0x01, 0x00]).await.ok()?;
+    let mut greeting = [0u8; 2];
+    ctrl.read_exact(&mut greeting).await.ok()?;
+    if greeting != [0x05, 0x00] {
+        return None;
+    }
+    ctrl.write_all(&[0x05, 0x03, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+        .await
+        .ok()?;
+    let mut reply = [0u8; 10];
+    ctrl.read_exact(&mut reply).await.ok()?;
+    if reply[1] != 0x00 {
+        return None;
+    }
+    let relay_port = u16::from_be_bytes([reply[8], reply[9]]);
+    let relay_addr: SocketAddr = format!("127.0.0.1:{relay_port}").parse().ok()?;
+
+    let client_udp = UdpSocket::bind("127.0.0.1:0").await.ok()?;
+    let target_ip = match target.ip() {
+        std::net::IpAddr::V4(v4) => v4.octets(),
+        std::net::IpAddr::V6(_) => return None,
+    };
+    let mut packet = vec![0x00, 0x00, 0x00, 0x01];
+    packet.extend_from_slice(&target_ip);
+    packet.extend_from_slice(&target.port().to_be_bytes());
+    packet.extend_from_slice(payload);
+
+    let mut result = None;
+    for _ in 0..30 {
+        client_udp.send_to(&packet, relay_addr).await.ok()?;
+        let mut buf = [0u8; 2048];
+        if let Ok(Ok((n, _))) =
+            tokio::time::timeout(Duration::from_millis(300), client_udp.recv_from(&mut buf)).await
+        {
+            result = Some(buf[..n].to_vec());
+            break;
+        }
+    }
+    drop(ctrl); // hold the control connection open until the exchange is done
+    result
 }
 
 // ───────────────────────── Task 18: end-to-end TCP ─────────────────────────
@@ -267,56 +350,118 @@ async fn socks5_udp_associate_through_tunnel() {
     // Confirm tunnel readiness with a TCP probe first.
     drop(retry_connect(proxy, tcp_echo).await);
 
-    // SOCKS5 UDP ASSOCIATE handshake.
-    let mut ctrl = TcpStream::connect(proxy).await.unwrap();
-    ctrl.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
-    let mut greeting = [0u8; 2];
-    ctrl.read_exact(&mut greeting).await.unwrap();
-    assert_eq!(greeting, [0x05, 0x00]);
-
-    // UDP ASSOCIATE request (cmd 0x03), client UDP addr 0.0.0.0:0.
-    ctrl.write_all(&[0x05, 0x03, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
-        .await
-        .unwrap();
-    let mut reply = [0u8; 10];
-    ctrl.read_exact(&mut reply).await.unwrap();
-    assert_eq!(reply[1], 0x00, "UDP ASSOCIATE should succeed");
-    let relay_port = u16::from_be_bytes([reply[8], reply[9]]);
-    let relay_addr: SocketAddr = format!("127.0.0.1:{relay_port}").parse().unwrap();
-
-    // Send a UDP datagram with a SOCKS5 UDP header pointing at the UDP echo server.
-    let client_udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    let echo_ip = match udp_echo.ip() {
-        std::net::IpAddr::V4(v4) => v4.octets(),
-        _ => panic!("ipv4"),
-    };
-    let mut packet = vec![0x00, 0x00, 0x00, 0x01]; // rsv, frag, atyp=IPv4
-    packet.extend_from_slice(&echo_ip);
-    packet.extend_from_slice(&udp_echo.port().to_be_bytes());
-    packet.extend_from_slice(b"udp-hello");
-
-    // The relay learns the client addr from the first packet; retry a few times
-    // in case the tunnel UDP stream is still being set up.
-    let mut got = None;
-    for _ in 0..30 {
-        client_udp.send_to(&packet, relay_addr).await.unwrap();
-        let mut buf = [0u8; 2048];
-        match tokio::time::timeout(Duration::from_millis(300), client_udp.recv_from(&mut buf)).await
-        {
-            Ok(Ok((n, _))) => {
-                got = Some(buf[..n].to_vec());
-                break;
-            }
-            _ => continue,
-        }
-    }
-
+    let echoed = udp_associate_echo(proxy, udp_echo, b"udp-hello").await;
     cancel.cancel();
 
-    let resp = got.expect("no UDP echo received through tunnel");
-    // Response carries a SOCKS5 UDP header; the payload is the trailing bytes.
+    let resp = echoed.expect("no UDP echo received through tunnel");
+    assert!(resp.ends_with(b"udp-hello"), "UDP echo payload mismatch: {resp:?}");
+}
+
+#[tokio::test]
+async fn socks5_udp_associate_standalone() {
+    let udp_echo = spawn_udp_echo().await;
+    let (socks_port, _) = two_free_ports().await;
+    let proxy: SocketAddr = format!("127.0.0.1:{socks_port}").parse().unwrap();
+    let cancel = CancellationToken::new();
+    start_standalone(socks_port, cancel.clone());
+    wait_for_listener(proxy).await;
+
+    let echoed = udp_associate_echo(proxy, udp_echo, b"standalone-udp").await;
+    cancel.cancel();
+
+    let resp = echoed.expect("no UDP echo received in standalone mode");
     assert!(
-        resp.ends_with(b"udp-hello"),
+        resp.ends_with(b"standalone-udp"),
         "UDP echo payload mismatch: {resp:?}"
     );
+}
+
+/// A SOCKS5 CONNECT request that arrives split across two TCP segments must
+/// still be parsed correctly (the server reads until the request is complete).
+#[tokio::test]
+async fn socks5_command_request_arriving_fragmented() {
+    let echo = spawn_tcp_echo().await;
+    let (socks_port, _) = two_free_ports().await;
+    let proxy: SocketAddr = format!("127.0.0.1:{socks_port}").parse().unwrap();
+    let cancel = CancellationToken::new();
+    start_standalone(socks_port, cancel.clone());
+    wait_for_listener(proxy).await;
+
+    let mut s = TcpStream::connect(proxy).await.unwrap();
+    s.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+    let mut greeting = [0u8; 2];
+    s.read_exact(&mut greeting).await.unwrap();
+    assert_eq!(greeting, [0x05, 0x00]);
+
+    // CONNECT request, deliberately split across two TCP segments.
+    let ip = match echo.ip() {
+        std::net::IpAddr::V4(v4) => v4.octets(),
+        std::net::IpAddr::V6(_) => panic!("ipv4"),
+    };
+    let mut req = vec![0x05, 0x01, 0x00, 0x01];
+    req.extend_from_slice(&ip);
+    req.extend_from_slice(&echo.port().to_be_bytes());
+    s.write_all(&req[..4]).await.unwrap();
+    s.flush().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    s.write_all(&req[4..]).await.unwrap();
+
+    let mut reply = [0u8; 10];
+    s.read_exact(&mut reply).await.unwrap();
+    assert_eq!(reply[1], 0x00, "fragmented CONNECT request should still succeed");
+
+    s.write_all(b"frag").await.unwrap();
+    let mut buf = [0u8; 4];
+    s.read_exact(&mut buf).await.unwrap();
+    assert_eq!(&buf, b"frag");
+
+    cancel.cancel();
+}
+
+/// A RFC 1929 username/password request that arrives split across two TCP
+/// segments must still be parsed correctly.
+#[tokio::test]
+async fn socks5_userpass_request_arriving_fragmented() {
+    let echo = spawn_tcp_echo().await;
+    let (socks_port, _) = two_free_ports().await;
+    let proxy: SocketAddr = format!("127.0.0.1:{socks_port}").parse().unwrap();
+    let cancel = CancellationToken::new();
+    start_standalone_with_auth(socks_port, "alice", "secret", cancel.clone());
+    wait_for_listener(proxy).await;
+
+    let mut s = TcpStream::connect(proxy).await.unwrap();
+    // Greeting offering the username/password method.
+    s.write_all(&[0x05, 0x01, 0x02]).await.unwrap();
+    let mut greeting = [0u8; 2];
+    s.read_exact(&mut greeting).await.unwrap();
+    assert_eq!(greeting, [0x05, 0x02], "server should select username/password");
+
+    // RFC 1929 request [ver=1, ulen=5, "alice", plen=6, "secret"], fragmented.
+    let mut auth = vec![0x01, 0x05];
+    auth.extend_from_slice(b"alice");
+    auth.push(0x06);
+    auth.extend_from_slice(b"secret");
+    s.write_all(&auth[..3]).await.unwrap();
+    s.flush().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    s.write_all(&auth[3..]).await.unwrap();
+
+    let mut auth_reply = [0u8; 2];
+    s.read_exact(&mut auth_reply).await.unwrap();
+    assert_eq!(auth_reply, [0x01, 0x00], "fragmented auth should still succeed");
+
+    // Continue with a normal CONNECT.
+    let ip = match echo.ip() {
+        std::net::IpAddr::V4(v4) => v4.octets(),
+        std::net::IpAddr::V6(_) => panic!("ipv4"),
+    };
+    let mut req = vec![0x05, 0x01, 0x00, 0x01];
+    req.extend_from_slice(&ip);
+    req.extend_from_slice(&echo.port().to_be_bytes());
+    s.write_all(&req).await.unwrap();
+    let mut reply = [0u8; 10];
+    s.read_exact(&mut reply).await.unwrap();
+    assert_eq!(reply[1], 0x00);
+
+    cancel.cancel();
 }

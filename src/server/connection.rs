@@ -125,15 +125,25 @@ async fn handle_socks5_inner(
     // Username/password subnegotiation (RFC 1929)
     if selected == AuthMethod::UsernamePassword {
         let auth_result = tokio::time::timeout(config.handshake_timeout, async {
-            let mut buf = [0u8; 513];
-            let n = stream.read(&mut buf).await?;
-            if n == 0 {
-                return Err(ServerError::Io(std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
-                    "client closed during auth",
-                )));
+            // Read until the full RFC 1929 request is available — it may arrive
+            // split across multiple TCP segments.
+            let mut buf = Vec::with_capacity(513);
+            let mut chunk = [0u8; 513];
+            loop {
+                let n = stream.read(&mut chunk).await?;
+                if n == 0 {
+                    return Err(ServerError::Io(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "client closed during auth",
+                    )));
+                }
+                buf.extend_from_slice(&chunk[..n]);
+                match parse_userpass_request(&buf) {
+                    Ok(creds) => return Ok(creds),
+                    Err(ProtocolError::Incomplete { .. }) if buf.len() <= 4096 => continue,
+                    Err(e) => return Err(ServerError::Protocol(e)),
+                }
             }
-            parse_userpass_request(&buf[..n]).map_err(ServerError::Protocol)
         })
         .await
         .map_err(|_| ServerError::Timeout)??;
@@ -155,18 +165,26 @@ async fn handle_socks5_inner(
         tracing::debug!(%peer_addr, %username, "authenticated");
     }
 
-    // Command request
+    // Command request — read until the full request is available; it may
+    // arrive split across multiple TCP segments.
     let cmd_request = tokio::time::timeout(config.handshake_timeout, async {
-        let mut buf = [0u8; 262];
-        let n = stream.read(&mut buf).await?;
-        if n == 0 {
-            return Err(ServerError::Io(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                "client closed during command",
-            )));
+        let mut buf = Vec::with_capacity(262);
+        let mut chunk = [0u8; 262];
+        loop {
+            let n = stream.read(&mut chunk).await?;
+            if n == 0 {
+                return Err(ServerError::Io(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "client closed during command",
+                )));
+            }
+            buf.extend_from_slice(&chunk[..n]);
+            match parse_command_request(&buf) {
+                Ok((req, _)) => return Ok(req),
+                Err(ProtocolError::Incomplete { .. }) if buf.len() <= 4096 => continue,
+                Err(e) => return Err(ServerError::Protocol(e)),
+            }
         }
-        let (req, _) = parse_command_request(&buf[..n]).map_err(ServerError::Protocol)?;
-        Ok(req)
     })
     .await
     .map_err(|_| ServerError::Timeout)??;
@@ -574,10 +592,9 @@ async fn handle_udp_associate(
     }
 
     // Standalone mode: relay directly from this server.
-    let client_udp_addr = SocketAddr::new(peer_addr.ip(), 0);
     let relay_result = tokio::time::timeout(
         ctx.config.idle_timeout,
-        relay_udp(tcp_control, relay_socket, client_udp_addr, cancel),
+        relay_udp(tcp_control, relay_socket, peer_addr.ip(), cancel),
     )
     .await;
 

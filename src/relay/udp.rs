@@ -23,7 +23,7 @@ use crate::tunnel::protocol::UdpDatagram;
 pub async fn relay_udp(
     tcp_control: TcpStream,
     relay_socket: UdpSocket,
-    client_addr: SocketAddr,
+    peer_ip: IpAddr,
     cancel: CancellationToken,
 ) -> io::Result<()> {
     let relay_socket = std::sync::Arc::new(relay_socket);
@@ -31,6 +31,12 @@ pub async fn relay_udp(
     // Map: target SocketAddr -> dedicated UdpSocket for that target
     let target_sockets: std::sync::Arc<tokio::sync::Mutex<HashMap<SocketAddr, std::sync::Arc<UdpSocket>>>> =
         std::sync::Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+
+    // The client's UDP address — its port is not known until the first
+    // datagram arrives, so it is learned dynamically and shared with the
+    // reverse relays.
+    let learned_client: Arc<std::sync::Mutex<Option<SocketAddr>>> =
+        Arc::new(std::sync::Mutex::new(None));
 
     // Task 1: Monitor TCP control stream for closure
     let cancel_tcp = cancel.clone();
@@ -54,6 +60,7 @@ pub async fn relay_udp(
     let cancel_c2t = cancel.clone();
     let relay_fwd = relay_socket.clone();
     let targets_fwd = target_sockets.clone();
+    let learned_c2t = learned_client.clone();
 
     let client_to_target = tokio::spawn(async move {
         let mut buf = vec![0u8; 65535];
@@ -70,11 +77,13 @@ pub async fn relay_udp(
                         }
                     };
 
-                    // Only accept packets from the original client
-                    if src != client_addr {
-                        tracing::trace!(%src, %client_addr, "dropping UDP from unexpected source");
+                    // Accept packets from the original client's IP; learn its
+                    // full address (including port) from the first one seen.
+                    if src.ip() != peer_ip {
+                        tracing::trace!(%src, %peer_ip, "dropping UDP from unexpected source");
                         continue;
                     }
+                    *learned_c2t.lock().unwrap() = Some(src);
 
                     // Parse SOCKS5 UDP header
                     let (header, payload_offset) = match parse_udp_header(&buf[..n]) {
@@ -121,13 +130,14 @@ pub async fn relay_udp(
                             let relay_back = relay_fwd.clone();
                             let sock_back = sock.clone();
                             let cancel_back = cancel_c2t.clone();
+                            let learned_back = learned_c2t.clone();
                             let target_for_header = header.target.clone();
 
                             tokio::spawn(async move {
                                 target_to_client(
                                     sock_back,
                                     relay_back,
-                                    client_addr,
+                                    learned_back,
                                     target_for_header,
                                     cancel_back,
                                 )
@@ -161,7 +171,7 @@ pub async fn relay_udp(
 async fn target_to_client(
     target_socket: std::sync::Arc<UdpSocket>,
     relay_socket: std::sync::Arc<UdpSocket>,
-    client_addr: SocketAddr,
+    learned_client: Arc<std::sync::Mutex<Option<SocketAddr>>>,
     target_addr: TargetAddr,
     cancel: CancellationToken,
 ) {
@@ -175,6 +185,11 @@ async fn target_to_client(
                 let (n, _src) = match result {
                     Ok(v) => v,
                     Err(_) => break,
+                };
+
+                // The client address is known only after its first packet.
+                let Some(client_addr) = *learned_client.lock().unwrap() else {
+                    continue;
                 };
 
                 // Wrap response in SOCKS5 UDP header
