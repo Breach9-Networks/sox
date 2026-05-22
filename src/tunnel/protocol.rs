@@ -6,6 +6,7 @@
 //! ```
 
 use crate::error::ServerError;
+use crate::protocol::addr::TargetAddr;
 
 /// Message types for the tunnel protocol.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -197,6 +198,42 @@ impl StreamReply {
             },
             3 + m_len,
         ))
+    }
+}
+
+/// UDP stream 上的單則 datagram：`[len:u16][atyp][addr][port:u16][payload]`。
+/// `len` 涵蓋其後全部位元組。addr 沿用 SOCKS5 的 atyp+addr+port 編碼。
+#[derive(Debug, Clone)]
+pub struct UdpDatagram {
+    pub addr: TargetAddr,
+    pub payload: Vec<u8>,
+}
+
+impl UdpDatagram {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut addr_bytes = Vec::new();
+        self.addr.write_socks5(&mut addr_bytes);
+        let body_len = addr_bytes.len() + self.payload.len();
+        let mut buf = Vec::with_capacity(2 + body_len);
+        buf.extend_from_slice(&(body_len as u16).to_be_bytes());
+        buf.extend_from_slice(&addr_bytes);
+        buf.extend_from_slice(&self.payload);
+        buf
+    }
+
+    /// Ok(None) = 資料不足；Ok(Some((dat, consumed))) = 解出一則；Err = 格式錯誤。
+    pub fn decode(buf: &[u8]) -> Result<Option<(Self, usize)>, ServerError> {
+        if buf.len() < 2 {
+            return Ok(None);
+        }
+        let body_len = u16::from_be_bytes([buf[0], buf[1]]) as usize;
+        if buf.len() < 2 + body_len {
+            return Ok(None);
+        }
+        let body = &buf[2..2 + body_len];
+        let (addr, addr_len) = TargetAddr::parse_socks5(body)?;
+        let payload = body[addr_len..].to_vec();
+        Ok(Some((UdpDatagram { addr, payload }, 2 + body_len)))
     }
 }
 
@@ -485,6 +522,27 @@ mod tests {
         assert_eq!(n, encoded.len());
         assert_eq!(d.status, 0);
         assert_eq!(d.message, "10.0.0.1:5555");
+    }
+
+    #[test]
+    fn roundtrip_udp_datagram() {
+        use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+        let addr = TargetAddr::Ip(SocketAddr::V4(SocketAddrV4::new(
+            Ipv4Addr::new(1, 2, 3, 4),
+            53,
+        )));
+        let dat = UdpDatagram { addr: addr.clone(), payload: vec![0xAB; 100] };
+        let bytes = dat.encode();
+        let (decoded, consumed) = UdpDatagram::decode(&bytes).unwrap().unwrap();
+        assert_eq!(consumed, bytes.len());
+        assert_eq!(decoded.addr, addr);
+        assert_eq!(decoded.payload, vec![0xAB; 100]);
+    }
+
+    #[test]
+    fn udp_datagram_partial_returns_none() {
+        // 只給半截 → decode 回 Ok(None) 表示「需要更多資料」
+        assert!(matches!(UdpDatagram::decode(&[0x00]), Ok(None)));
     }
 
     #[test]
