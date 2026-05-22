@@ -1,6 +1,19 @@
 //! yamux session 的建立、驅動與（client 端）連線池。
 
-use yamux::Config;
+use std::io;
+use std::time::{Duration, Instant};
+
+use tokio::net::TcpStream;
+use tokio_util::compat::TokioAsyncReadCompatExt;
+use tokio_util::sync::CancellationToken;
+use yamux::{Config, Connection, Mode, Stream};
+
+use crate::tunnel::backoff::Backoff;
+use crate::tunnel::noise::{derive_psk, NoiseStream};
+use crate::tunnel::protocol::{Hello, HelloAck, PROTO_VERSION};
+
+/// session 穩定存活超過此時間後，視為「健康」，重連退避歸零。
+const STABLE_AFTER: Duration = Duration::from_secs(30);
 
 /// 依 spec §6 建構 yamux Config。
 ///
@@ -14,6 +27,180 @@ pub fn yamux_config(max_streams: usize, recv_window_mb: usize) -> Config {
     let requested = recv_window_mb * 1024 * 1024;
     cfg.set_max_connection_receive_window(Some(requested.max(floor)));
     cfg
+}
+
+/// `SessionPool` 的可調參數。
+#[derive(Debug, Clone)]
+pub struct SessionPoolConfig {
+    /// 維護幾條並行的 yamux session。
+    pub sessions: u16,
+    /// 每條 session 的 stream 上限。
+    pub max_streams: usize,
+    /// 每條 session 的 yamux 總接收窗（MiB）。
+    pub recv_window_mb: usize,
+    /// 重連退避基數。
+    pub reconnect_base: Duration,
+    /// 重連退避封頂。
+    pub reconnect_max: Duration,
+}
+
+/// Client 端的 yamux session 連線池。
+///
+/// 維護 `sessions` 條到 tunnel server 的 session，每條獨立斷線、
+/// 獨立以指數退避重連。server 透過這些 session 開 inbound stream，
+/// 每條 stream 對應一個 proxy flow。
+pub struct SessionPool {
+    server_addr: String,
+    client_id: String,
+    psk: [u8; 32],
+    cfg: SessionPoolConfig,
+}
+
+impl SessionPool {
+    pub fn new(
+        server_addr: String,
+        client_id: String,
+        secret: &str,
+        cfg: SessionPoolConfig,
+    ) -> Self {
+        Self {
+            server_addr,
+            client_id,
+            psk: derive_psk(secret),
+            cfg,
+        }
+    }
+
+    /// 啟動連線池 —— 為每條 session spawn 一個獨立維護的 worker。
+    pub fn start(&self, cancel: CancellationToken) {
+        for index in 0..self.cfg.sessions {
+            let server_addr = self.server_addr.clone();
+            let client_id = self.client_id.clone();
+            let psk = self.psk;
+            let cfg = self.cfg.clone();
+            let cancel = cancel.clone();
+            tokio::spawn(async move {
+                session_worker(index, server_addr, client_id, psk, cfg, cancel).await;
+            });
+        }
+    }
+}
+
+/// 單條 session 的長壽 worker：建立連線、斷線後以指數退避重連，
+/// 直到被取消。
+async fn session_worker(
+    index: u16,
+    server_addr: String,
+    client_id: String,
+    psk: [u8; 32],
+    cfg: SessionPoolConfig,
+    cancel: CancellationToken,
+) {
+    let mut backoff = Backoff::new(cfg.reconnect_base, cfg.reconnect_max);
+    loop {
+        if cancel.is_cancelled() {
+            return;
+        }
+        let started = Instant::now();
+        match run_session(
+            index,
+            &server_addr,
+            &client_id,
+            &psk,
+            cfg.max_streams,
+            cfg.recv_window_mb,
+            &cancel,
+        )
+        .await
+        {
+            Ok(()) => return, // 乾淨取消
+            Err(e) => {
+                if cancel.is_cancelled() {
+                    return;
+                }
+                // session 曾穩定存活 → 視為健康，退避歸零。
+                if started.elapsed() > STABLE_AFTER {
+                    backoff.reset();
+                }
+                let delay = backoff.next_delay();
+                tracing::debug!(index, error = %e, ?delay, "session lost, reconnecting");
+                tokio::select! {
+                    _ = cancel.cancelled() => return,
+                    _ = tokio::time::sleep(delay) => {}
+                }
+            }
+        }
+    }
+}
+
+/// 建立一條 session 並驅動其 yamux 連線，直到斷線或被取消。
+///
+/// 回傳 `Ok(())` 僅代表「乾淨取消」；任何其他結束（含對端關閉）回 `Err`，
+/// 讓 worker 重連。
+async fn run_session(
+    index: u16,
+    server_addr: &str,
+    client_id: &str,
+    psk: &[u8; 32],
+    max_streams: usize,
+    recv_window_mb: usize,
+    cancel: &CancellationToken,
+) -> io::Result<()> {
+    let tcp = TcpStream::connect(server_addr).await?;
+    tcp.set_nodelay(true)?;
+
+    // Noise 握手。
+    let mut noise = NoiseStream::connect(tcp, psk).await?;
+
+    // Hello / HelloAck 握手（yamux 之前）。
+    let hello = Hello {
+        proto_version: PROTO_VERSION,
+        session_index: index,
+        client_id: client_id.to_string(),
+    };
+    noise.send(&hello.encode()).await?;
+    let ack_bytes = noise.recv().await?;
+    let ack = HelloAck::decode(&ack_bytes)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+    if !ack.accepted {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("server rejected session: {}", ack.reason),
+        ));
+    }
+
+    // 轉成位元組流，疊上 yamux（client 端為 Mode::Client，接 inbound stream）。
+    let compat = noise.into_byte_stream().compat();
+    let mut conn = Connection::new(compat, yamux_config(max_streams, recv_window_mb), Mode::Client);
+
+    tracing::info!(index, "tunnel session established");
+
+    loop {
+        let inbound = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => break,
+            inbound = std::future::poll_fn(|cx| conn.poll_next_inbound(cx)) => inbound,
+        };
+        match inbound {
+            Some(Ok(stream)) => {
+                tokio::spawn(handle_inbound_stream(stream, cancel.clone()));
+            }
+            Some(Err(e)) => return Err(io::Error::other(format!("yamux: {e}"))),
+            None => return Err(io::Error::other("session closed by peer")),
+        }
+    }
+
+    // 被取消 —— 盡力優雅關閉。
+    let _ = std::future::poll_fn(|cx| conn.poll_close(cx)).await;
+    Ok(())
+}
+
+/// 處理一條 server 開來的 inbound stream。
+///
+/// Task 13 會以「讀 preamble → dial 目標 → relay」取代此 stub。
+async fn handle_inbound_stream(stream: Stream, _cancel: CancellationToken) {
+    // stub：尚未實作 → 讓 stream 在函式結束時 drop（等同 reset）。
+    let _ = stream;
 }
 
 #[cfg(test)]
