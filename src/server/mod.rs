@@ -109,7 +109,17 @@ pub async fn run_standalone(
             }
 
             result = listener.accept() => {
-                let (stream, peer_addr) = result?;
+                let (stream, peer_addr) = match result {
+                    Ok(pair) => pair,
+                    Err(e) => {
+                        // A failed accept (e.g. EMFILE/ENFILE — fd exhaustion)
+                        // must not kill the server. Back off briefly so we do
+                        // not busy-spin, then keep accepting.
+                        tracing::warn!(error = %e, "accept failed, backing off");
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        continue;
+                    }
+                };
 
                 // Global connection limit
                 let permit = match limiter.clone().try_acquire_owned() {
@@ -324,7 +334,17 @@ pub async fn run_server(
             biased;
             _ = shutdown.cancelled() => break,
             result = listener.accept() => {
-                let (stream, peer_addr) = result?;
+                let (stream, peer_addr) = match result {
+                    Ok(pair) => pair,
+                    Err(e) => {
+                        // A failed accept (e.g. EMFILE/ENFILE — fd exhaustion)
+                        // must not kill the server. Back off briefly so we do
+                        // not busy-spin, then keep accepting.
+                        tracing::warn!(error = %e, "accept failed, backing off");
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        continue;
+                    }
+                };
 
                 let permit = match limiter.clone().try_acquire_owned() {
                     Ok(p) => p,
