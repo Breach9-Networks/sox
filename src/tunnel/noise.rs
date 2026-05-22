@@ -103,6 +103,12 @@ impl NoiseStream {
         self.stream
     }
 
+    /// 消費此 NoiseStream，轉成位元組流形態供 yamux 使用。
+    /// 握手後的 transport 狀態與 nonce 計數延續。
+    pub fn into_byte_stream(self) -> crate::tunnel::noise_stream::NoiseByteStream {
+        crate::tunnel::noise_stream::NoiseByteStream::new(self.stream, self.transport)
+    }
+
     /// Split into independent send/receive halves for concurrent bidirectional relay.
     pub fn split(self) -> (NoiseSender, NoiseReceiver) {
         let (read_half, write_half) = self.stream.into_split();
