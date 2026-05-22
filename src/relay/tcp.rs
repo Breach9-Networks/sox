@@ -2,7 +2,7 @@ use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 use crate::tunnel::noise::{NoiseSender, NoiseReceiver};
@@ -171,4 +171,90 @@ pub async fn relay_tunneled(
     let tx = tx_total.load(Ordering::Relaxed);
     let rx = rx_total.load(Ordering::Relaxed);
     Ok((tx, rx))
+}
+
+/// 在任兩個雙向串流間 relay，附 live byte 計數。
+/// 回傳 `(a→b bytes, b→a bytes)`。
+///
+/// 用 `join!`（非 `try_join!`）讓兩個方向都跑完 —— `try_join!` 會在
+/// 一邊出錯時中途取消另一邊，可能留下半寫的 frame。
+pub async fn relay_bidirectional<A, B>(
+    a: &mut A,
+    b: &mut B,
+    live_ab: Option<&AtomicU64>,
+    live_ba: Option<&AtomicU64>,
+) -> io::Result<(u64, u64)>
+where
+    A: AsyncRead + AsyncWrite + Unpin,
+    B: AsyncRead + AsyncWrite + Unpin,
+{
+    let (mut ar, mut aw) = tokio::io::split(a);
+    let (mut br, mut bw) = tokio::io::split(b);
+
+    let ab_total = Arc::new(AtomicU64::new(0));
+    let ba_total = Arc::new(AtomicU64::new(0));
+    let ab_c = ab_total.clone();
+    let ba_c = ba_total.clone();
+
+    let a_to_b = async {
+        let mut buf = [0u8; 16384];
+        loop {
+            let n = ar.read(&mut buf).await?;
+            if n == 0 {
+                bw.shutdown().await?;
+                break;
+            }
+            bw.write_all(&buf[..n]).await?;
+            ab_c.fetch_add(n as u64, Ordering::Relaxed);
+            if let Some(c) = live_ab {
+                c.fetch_add(n as u64, Ordering::Relaxed);
+            }
+        }
+        Ok::<(), io::Error>(())
+    };
+    let b_to_a = async {
+        let mut buf = [0u8; 16384];
+        loop {
+            let n = br.read(&mut buf).await?;
+            if n == 0 {
+                aw.shutdown().await?;
+                break;
+            }
+            aw.write_all(&buf[..n]).await?;
+            ba_c.fetch_add(n as u64, Ordering::Relaxed);
+            if let Some(c) = live_ba {
+                c.fetch_add(n as u64, Ordering::Relaxed);
+            }
+        }
+        Ok::<(), io::Error>(())
+    };
+
+    let _ = tokio::join!(a_to_b, b_to_a);
+    Ok((ab_total.load(Ordering::Relaxed), ba_total.load(Ordering::Relaxed)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{duplex, AsyncReadExt as _, AsyncWriteExt as _};
+
+    #[tokio::test]
+    async fn relay_copies_both_directions() {
+        let (mut a, mut a_outer) = duplex(1024);
+        let (mut b, mut b_outer) = duplex(1024);
+
+        let relay = tokio::spawn(async move {
+            relay_bidirectional(&mut a, &mut b, None, None).await
+        });
+
+        a_outer.write_all(b"ping").await.unwrap();
+        a_outer.shutdown().await.unwrap();
+        let mut got = Vec::new();
+        b_outer.read_to_end(&mut got).await.unwrap();
+        assert_eq!(got, b"ping");
+
+        b_outer.shutdown().await.unwrap();
+        let (tx, _rx) = relay.await.unwrap().unwrap();
+        assert_eq!(tx, 4);
+    }
 }
