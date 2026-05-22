@@ -37,10 +37,29 @@
 - **行為變更**：`run_client` 不再「失敗 30 分鐘後放棄」，改為永久重連。刻意如此
   （daemon 應持續嘗試），但與舊行為不同。
 
-**未做（範圍外，另案）**
+## 後續修正（multiplexing 之後）
 
-- Noise NN → XX/IK 升級（mutual auth、可撤銷單一 client key）—— spec 明列非目標。
-- monitor dashboard 無認證保護 —— 原始分析有標記，未處理。
-- 既有 clippy 警告 `addr.rs items_after_test_module` —— 早於本次重構，未動。
-- standalone 模式的 direct `relay_udp` 有既有的 client-addr 過濾瑕疵（以 ip:0 過濾）；
-  tunnel 路徑的 `relay_udp_tunneled` 已正確處理（依 IP 過濾、動態學 client addr）。
+**已修 bug**
+
+- standalone 模式 UDP ASSOCIATE 全斷：`relay_udp` 用 port-0 sentinel 過濾來源，
+  丟光所有 datagram —— 改為依 IP 過濾、從首包動態學 client 位址。
+- SOCKS5 command / RFC 1929 auth request 用單次 `read()`，分片到達時解析
+  失敗、連線被丟 —— 改為讀到 parser 回報完整為止。
+- 新增三個重現測試（standalone UDP、command 分片、auth 分片）。共 61 測試。
+
+**待辦（TrustTunnel 可再借鏡，依優先序）**
+
+- DNS-aware UDP 生命週期：port 53 追蹤 pending query 數，回完即關。
+- Lazy 連線限制 acquire：限制「已認證」連線而非 idle TCP accept。
+- Graceful shutdown completion barrier：tunnel 側等 in-flight relay 收尾再關。
+- RAII metrics guard：active 計數綁物件生命週期，防 panic 路徑洩漏。
+- accept loop 致命錯誤（`EMFILE`）用 watch-channel 傳播，避免 busy-spin。
+- monitor dashboard 加 Bearer token 認證。
+- `sox init` 互動式設定精靈 + 高強度隨機 secret 產生。
+- 啟動自動抬高 fd limit（目前只檢查並警告）。
+- IdChain 階層式 log ID、Prometheus `/metrics` endpoint、可選 crash 上報。
+- Noise NN → XX/IK 升級（mutual auth、可撤銷單一 client key）。
+
+**已知小瑕疵**
+
+- clippy `addr.rs items_after_test_module` —— 早於本次工作，未動。
