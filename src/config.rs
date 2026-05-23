@@ -79,7 +79,11 @@ impl Default for Config {
             tcp_keepalive_probes: 3,
             monitor_addr: None,
             tunnel_max_streams: 256,
-            tunnel_recv_window_mb: 64,
+            // See `src/tunnel/session.rs::yamux_config` for why this must stay
+            // well above `tunnel_max_streams × 256 KiB`: smaller values leave
+            // zero headroom for yamux per-stream BDP auto-tuning, capping
+            // single-stream throughput at ~256 KiB / RTT.
+            tunnel_recv_window_mb: 256,
         }
     }
 }
@@ -168,7 +172,17 @@ impl FileConfig {
             config.dns_timeout = Duration::from_secs(v);
         }
         if let Some(v) = self.idle_timeout {
-            config.idle_timeout = Duration::from_secs(v);
+            // 0 = 「停用」表達意圖不明,而 relay 層收到 Duration::ZERO
+            // 會立刻 idle 收工 —— 一律當作 misconfig 並警告,維持預設值。
+            if v == 0 {
+                tracing::warn!(
+                    "config: idle_timeout = 0 is invalid (would close every relay instantly), \
+                     keeping default {}s",
+                    config.idle_timeout.as_secs()
+                );
+            } else {
+                config.idle_timeout = Duration::from_secs(v);
+            }
         }
         if let Some(v) = self.drain_timeout {
             config.drain_timeout = Duration::from_secs(v);

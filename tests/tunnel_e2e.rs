@@ -102,6 +102,8 @@ fn start_client(
         recv_window_mb,
         reconnect_interval: Duration::from_millis(200),
         reconnect_max: Duration::from_secs(2),
+        connect_timeout: Duration::from_secs(10),
+        idle_timeout: Duration::from_secs(300),
     };
     tokio::spawn(sox::client::run_client(cfg, cancel));
 }

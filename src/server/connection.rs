@@ -311,31 +311,24 @@ async fn handle_socks4_connect(
         "SOCKS4 CONNECT established, starting relay"
     );
 
-    let relay_result = tokio::time::timeout(
-        config.idle_timeout,
-        relay_tcp_live(
-            stream,
-            &mut target_stream,
-            Some(&ctx.metrics.bytes_client_to_target),
-            Some(&ctx.metrics.bytes_target_to_client),
-        ),
+    // `idle_timeout` is enforced inside the relay as a true inactivity timer,
+    // not a wall-clock cap — an actively transferring connection is not cut.
+    // Live counters mean bytes are already in the global metrics; the
+    // returned tuple is only used for the log line + error propagation.
+    let (c2s, s2c, outcome) = relay_tcp_live(
+        stream,
+        &mut target_stream,
+        Some(&ctx.metrics.bytes_client_to_target),
+        Some(&ctx.metrics.bytes_target_to_client),
+        Some(config.idle_timeout),
     )
     .await;
 
-    let (c2s, s2c) = match relay_result {
-        Ok(Ok(bytes)) => bytes,
-        Ok(Err(e)) => {
-            tracing::debug!(%peer_addr, %target, error = %e, "relay error");
-            return Err(ServerError::Io(e));
-        }
-        Err(_) => {
-            tracing::debug!(%peer_addr, %target, "relay idle timeout");
-            return Err(ServerError::Timeout);
-        }
-    };
-
+    if let Err(e) = outcome {
+        tracing::debug!(%peer_addr, %target, c2s, s2c, error = %e, "SOCKS4 relay error");
+        return Err(ServerError::Io(e));
+    }
     tracing::debug!(%peer_addr, %target, c2s, s2c, "SOCKS4 relay finished");
-
     Ok(())
 }
 
@@ -397,31 +390,24 @@ async fn handle_connect(
         "CONNECT established, starting relay"
     );
 
-    let relay_result = tokio::time::timeout(
-        config.idle_timeout,
-        relay_tcp_live(
-            stream,
-            &mut target_stream,
-            Some(&ctx.metrics.bytes_client_to_target),
-            Some(&ctx.metrics.bytes_target_to_client),
-        ),
+    // `idle_timeout` is enforced inside the relay as a true inactivity timer,
+    // not a wall-clock cap — an actively transferring connection is not cut.
+    // Live counters mean bytes are already in the global metrics; the
+    // returned tuple is only used for the log line + error propagation.
+    let (c2s, s2c, outcome) = relay_tcp_live(
+        stream,
+        &mut target_stream,
+        Some(&ctx.metrics.bytes_client_to_target),
+        Some(&ctx.metrics.bytes_target_to_client),
+        Some(config.idle_timeout),
     )
     .await;
 
-    let (c2s, s2c) = match relay_result {
-        Ok(Ok(bytes)) => bytes,
-        Ok(Err(e)) => {
-            tracing::debug!(%peer_addr, %target, error = %e, "relay error");
-            return Err(ServerError::Io(e));
-        }
-        Err(_) => {
-            tracing::debug!(%peer_addr, %target, "relay idle timeout");
-            return Err(ServerError::Timeout);
-        }
-    };
-
+    if let Err(e) = outcome {
+        tracing::debug!(%peer_addr, %target, c2s, s2c, error = %e, "relay error");
+        return Err(ServerError::Io(e));
+    }
     tracing::debug!(%peer_addr, %target, c2s, s2c, "relay finished");
-
     Ok(())
 }
 
@@ -475,14 +461,25 @@ async fn handle_connect_via_tunnel(
     tracing::debug!(%peer_addr, %target, "routing CONNECT through tunnel");
 
     // Write the StreamOpen preamble, then read the client's StreamReply.
+    // On any failure here the SOCKS client is still blocked waiting for its
+    // CONNECT reply — send one before returning so it fails fast with a code.
     let preamble = StreamOpen::Tcp { target: target_str }.encode();
-    tunnel_io.write_all(&preamble).await?;
+    if let Err(e) = tunnel_io.write_all(&preamble).await {
+        reply_socks5_failure(stream, ReplyCode::GeneralFailure).await;
+        return Err(ServerError::Io(e));
+    }
 
     let reply: StreamReply =
         match tokio::time::timeout(config.connect_timeout, read_stream_reply(&mut tunnel_io)).await {
             Ok(Ok(r)) => r,
-            Ok(Err(e)) => return Err(ServerError::Io(e)),
-            Err(_) => return Err(ServerError::Timeout),
+            Ok(Err(e)) => {
+                reply_socks5_failure(stream, ReplyCode::GeneralFailure).await;
+                return Err(ServerError::Io(e));
+            }
+            Err(_) => {
+                reply_socks5_failure(stream, ReplyCode::TtlExpired).await;
+                return Err(ServerError::Timeout);
+            }
         };
 
     if reply.status != 0 {
@@ -508,32 +505,25 @@ async fn handle_connect_via_tunnel(
     tracing::debug!(%peer_addr, %target, "tunnel CONNECT established, starting relay");
 
     // "tx" = SOCKS client -> target ; "rx" = target -> SOCKS client.
-    let relay_result = tokio::time::timeout(
-        config.idle_timeout,
-        relay_bidirectional(
-            stream,
-            &mut tunnel_io,
-            Some(tx_bytes.as_ref()),
-            Some(rx_bytes.as_ref()),
-        ),
+    // `idle_timeout` is enforced inside the relay as a true inactivity timer;
+    // byte counts are returned unconditionally so the global metrics below
+    // are updated even when the relay ends on an error or idle stop.
+    let (c2s, s2c, outcome) = relay_bidirectional(
+        stream,
+        &mut tunnel_io,
+        Some(tx_bytes.as_ref()),
+        Some(rx_bytes.as_ref()),
+        Some(config.idle_timeout),
     )
     .await;
-
-    let (c2s, s2c) = match relay_result {
-        Ok(Ok(bytes)) => bytes,
-        Ok(Err(e)) => {
-            tracing::debug!(%peer_addr, %target, error = %e, "tunnel relay error");
-            return Err(ServerError::Io(e));
-        }
-        Err(_) => {
-            tracing::debug!(%peer_addr, %target, "tunnel relay idle timeout");
-            return Err(ServerError::Timeout);
-        }
-    };
 
     ctx.metrics.bytes_client_to_target.fetch_add(c2s, AtomOrd::Relaxed);
     ctx.metrics.bytes_target_to_client.fetch_add(s2c, AtomOrd::Relaxed);
 
+    if let Err(e) = outcome {
+        tracing::debug!(%peer_addr, %target, c2s, s2c, error = %e, "tunnel relay error");
+        return Err(ServerError::Io(e));
+    }
     tracing::debug!(%peer_addr, %target, c2s, s2c, "tunnel relay finished");
     Ok(())
 }
@@ -554,7 +544,23 @@ where
     })
 }
 
+/// Send a SOCKS5 command reply carrying `code` to the client, ignoring any
+/// write error. Used on tunnel CONNECT error paths so the client fails fast
+/// with a proper reply code instead of waiting on a silently-closed socket.
+async fn reply_socks5_failure(stream: &mut TcpStream, code: ReplyCode) {
+    let mut buf = Vec::new();
+    write_command_reply(code, &TargetAddr::unspecified(), &mut buf);
+    let _ = stream.write_all(&buf).await;
+}
+
 /// Handle SOCKS5 UDP ASSOCIATE command.
+///
+/// **Reply ordering invariant:** in tunnel mode, the SOCKS5 success reply is
+/// deferred until the tunnel UDP stream is opened — otherwise the client
+/// gets a working-looking relay_addr but datagrams sent there are silently
+/// dropped (e.g., when no tunnel client is available). Standalone mode can
+/// reply immediately because the relay is local and always usable once
+/// bind succeeds.
 async fn handle_udp_associate(
     stream: &mut TcpStream,
     peer_addr: SocketAddr,
@@ -565,12 +571,6 @@ async fn handle_udp_associate(
     let relay_addr = relay_socket.local_addr()?;
 
     tracing::debug!(%peer_addr, relay = %relay_addr, "UDP ASSOCIATE relay bound");
-
-    // Reply with the relay socket address.
-    let bind_addr = TargetAddr::Ip(relay_addr);
-    let mut reply = Vec::new();
-    write_command_reply(ReplyCode::Succeeded, &bind_addr, &mut reply);
-    stream.write_all(&reply).await?;
 
     // When the TCP control stream closes, the UDP relay must stop.
     let cancel = CancellationToken::new();
@@ -583,15 +583,20 @@ async fn handle_udp_associate(
         TcpStream::from_std(std::net::TcpStream::from(dup_socket))?
     };
 
-    // Tunnel mode: route UDP through a tunnel client.
+    // Tunnel mode: open the tunnel UDP stream FIRST, then reply.
     if let Some(router) = &ctx.router {
         return handle_udp_associate_via_tunnel(
-            peer_addr, relay_socket, tcp_control, ctx, router, cancel,
+            stream, peer_addr, relay_addr, relay_socket, tcp_control, ctx, router, cancel,
         )
         .await;
     }
 
-    // Standalone mode: relay directly from this server.
+    // Standalone mode: relay is local, safe to reply immediately.
+    let bind_addr = TargetAddr::Ip(relay_addr);
+    let mut reply = Vec::new();
+    write_command_reply(ReplyCode::Succeeded, &bind_addr, &mut reply);
+    stream.write_all(&reply).await?;
+
     let relay_result = tokio::time::timeout(
         ctx.config.idle_timeout,
         relay_udp(tcp_control, relay_socket, peer_addr.ip(), cancel),
@@ -609,8 +614,16 @@ async fn handle_udp_associate(
 }
 
 /// Route a UDP ASSOCIATE session through a tunnel client over a yamux stream.
+///
+/// The SOCKS5 success reply is sent **only after** the tunnel UDP stream is
+/// open and the client's StreamReply confirms readiness; any failure before
+/// then is reported via `reply_socks5_failure` so the SOCKS client fails
+/// fast with a proper reply code instead of getting a useless relay_addr.
+#[allow(clippy::too_many_arguments)]
 async fn handle_udp_associate_via_tunnel(
+    stream: &mut TcpStream,
     peer_addr: SocketAddr,
+    relay_addr: SocketAddr,
     relay_socket: UdpSocket,
     tcp_control: TcpStream,
     ctx: &ServerContext,
@@ -620,16 +633,25 @@ async fn handle_udp_associate_via_tunnel(
     use crate::tunnel::protocol::StreamOpen;
     use tokio_util::compat::FuturesAsyncReadCompatExt;
 
-    let tunnel = router.open_stream(None).await.ok_or_else(|| {
-        ServerError::Io(std::io::Error::new(
-            std::io::ErrorKind::NotConnected,
-            "no tunnel clients available",
-        ))
-    })?;
+    let tunnel = match router.open_stream(None).await {
+        Some(t) => t,
+        None => {
+            reply_socks5_failure(stream, ReplyCode::GeneralFailure).await;
+            return Err(ServerError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                "no tunnel clients available",
+            )));
+        }
+    };
     let mut tunnel_io = tunnel.stream.compat();
 
     // Open a UDP stream: write the preamble, await the client's reply.
-    tunnel_io.write_all(&StreamOpen::Udp.encode()).await?;
+    // On any failure here send a SOCKS5 failure reply before returning —
+    // the client is still blocked waiting for the UDP ASSOCIATE reply.
+    if let Err(e) = tunnel_io.write_all(&StreamOpen::Udp.encode()).await {
+        reply_socks5_failure(stream, ReplyCode::GeneralFailure).await;
+        return Err(ServerError::Io(e));
+    }
     let reply = match tokio::time::timeout(
         ctx.config.connect_timeout,
         read_stream_reply(&mut tunnel_io),
@@ -637,15 +659,28 @@ async fn handle_udp_associate_via_tunnel(
     .await
     {
         Ok(Ok(r)) => r,
-        Ok(Err(e)) => return Err(ServerError::Io(e)),
-        Err(_) => return Err(ServerError::Timeout),
+        Ok(Err(e)) => {
+            reply_socks5_failure(stream, ReplyCode::GeneralFailure).await;
+            return Err(ServerError::Io(e));
+        }
+        Err(_) => {
+            reply_socks5_failure(stream, ReplyCode::TtlExpired).await;
+            return Err(ServerError::Timeout);
+        }
     };
     if reply.status != 0 {
+        reply_socks5_failure(stream, ReplyCode::from_u8(reply.status)).await;
         return Err(ServerError::Io(std::io::Error::new(
             std::io::ErrorKind::ConnectionRefused,
             reply.message,
         )));
     }
+
+    // Tunnel ready — NOW send the SOCKS5 success reply with relay_addr.
+    let bind_addr = TargetAddr::Ip(relay_addr);
+    let mut buf = Vec::new();
+    write_command_reply(ReplyCode::Succeeded, &bind_addr, &mut buf);
+    stream.write_all(&buf).await?;
 
     tracing::debug!(%peer_addr, "UDP ASSOCIATE routed through tunnel");
 
@@ -666,6 +701,10 @@ async fn handle_udp_associate_via_tunnel(
 }
 
 /// Configure target socket: NODELAY + keepalive.
+///
+/// Probe count (`TCP_KEEPCNT`) is applied via libc on unix for consistency
+/// across glibc Linux / musl Linux / macOS; Windows uses OS defaults
+/// (`socket2::TcpKeepalive::with_retries` is Linux-only).
 fn configure_target_socket(stream: &TcpStream, config: &Config) -> Result<(), std::io::Error> {
     let sock_ref = SockRef::from(stream);
     sock_ref.set_nodelay(true)?;
@@ -674,10 +713,8 @@ fn configure_target_socket(stream: &TcpStream, config: &Config) -> Result<(), st
         .with_time(config.tcp_keepalive_idle)
         .with_interval(config.tcp_keepalive_interval);
 
-    #[cfg(all(target_os = "linux", not(target_env = "musl")))]
-    let keepalive = keepalive.with_retries(config.tcp_keepalive_probes);
-
     sock_ref.set_tcp_keepalive(&keepalive)?;
+    crate::tunnel::set_keepalive_probes(stream, config.tcp_keepalive_probes);
     Ok(())
 }
 

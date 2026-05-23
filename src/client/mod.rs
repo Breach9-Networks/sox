@@ -25,6 +25,10 @@ pub struct ClientConfig {
     pub reconnect_interval: Duration,
     /// Reconnect backoff cap.
     pub reconnect_max: Duration,
+    /// Timeout for dialing a proxied target.
+    pub connect_timeout: Duration,
+    /// Idle timeout for a relay (no data in either direction).
+    pub idle_timeout: Duration,
 }
 
 /// Run the tunnel client until cancelled. Sessions self-heal via backoff.
@@ -46,6 +50,8 @@ pub async fn run_client(config: ClientConfig, cancel: CancellationToken) {
             recv_window_mb: config.recv_window_mb,
             reconnect_base: config.reconnect_interval,
             reconnect_max: config.reconnect_max,
+            connect_timeout: config.connect_timeout,
+            idle_timeout: config.idle_timeout,
         },
     );
     pool.start(cancel.clone());

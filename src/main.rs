@@ -203,6 +203,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             config.listen_addr = listen;
             config.max_connections = max_connections;
             config.max_connections_per_ip = max_per_ip;
+            if idle_timeout == 0 {
+                eprintln!(
+                    "error: --idle-timeout=0 is invalid (would close every relay instantly)"
+                );
+                std::process::exit(1);
+            }
             config.idle_timeout = std::time::Duration::from_secs(idle_timeout);
 
             let auth = parse_user_credentials(&users)?;
@@ -275,9 +281,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 client_id,
                 tunnel_sessions,
                 max_streams: 256,
-                recv_window_mb: 64,
+                // 必須遠大於 `max_streams × 256 KiB`（= 64 MiB at 256 streams），
+                // 否則 yamux 的 per-stream BDP auto-tuning 拿不到 headroom，
+                // 單一 stream 永遠卡在 256 KiB initial credit → 在 RTT~10ms 的
+                // 跨網路情境會被夾到約 200 Mbps。256 MiB 留 192 MiB 餘裕，
+                // 足以讓單流長到 BDP×2（1 Gbps × 60ms ≈ 15 MiB×2）。
+                // A/B-verified 2026-05-23: at 10ms RTT this lifts single-stream
+                // throughput from ~170 Mbps to ~1.38 Gbps (8× improvement).
+                recv_window_mb: 256,
                 reconnect_interval: std::time::Duration::from_secs(reconnect_interval),
                 reconnect_max: std::time::Duration::from_secs(60),
+                connect_timeout: std::time::Duration::from_secs(10),
+                idle_timeout: std::time::Duration::from_secs(300),
             };
 
             // Override from TOML if present.

@@ -899,6 +899,7 @@ version = "0.1.0"
 dependencies = [
  "blake2",
  "clap",
+ "futures",
  "libc",
  "rand",
  "serde",

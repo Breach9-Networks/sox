@@ -11,7 +11,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::protocol::addr::TargetAddr;
 use crate::protocol::socks5::udp::{parse_udp_header, write_udp_header, UdpHeader};
-use crate::tunnel::protocol::UdpDatagram;
+use crate::tunnel::protocol::{UdpDatagram, MAX_UDP_DATAGRAM_BODY};
 
 /// Standard DNS port. UDP flows whose peer port is 53 are treated as DNS.
 const DNS_PORT: u16 = 53;
@@ -309,6 +309,12 @@ where
     let mut len_buf = [0u8; 2];
     s.read_exact(&mut len_buf).await?;
     let body_len = u16::from_be_bytes(len_buf) as usize;
+    if body_len > MAX_UDP_DATAGRAM_BODY {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "UdpDatagram: body length exceeds limit",
+        ));
+    }
     let mut frame = vec![0u8; 2 + body_len];
     frame[..2].copy_from_slice(&len_buf);
     s.read_exact(&mut frame[2..]).await?;

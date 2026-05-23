@@ -9,7 +9,20 @@ use crate::error::ServerError;
 use crate::protocol::addr::TargetAddr;
 
 /// 目前的 tunnel 協定版本。Hello 不符即拒絕。
-pub const PROTO_VERSION: u8 = 1;
+///
+/// 升版規則:任何 wire 層的非相容變更都必須遞增。版本 2 對應
+/// `Hello.client_id` 長度欄位從 u8 改為 u16(2026-05)。
+pub const PROTO_VERSION: u8 = 2;
+
+/// 各訊息變動長度欄位的解碼上限 —— 防止惡意 peer 透過大長度欄位
+/// 觸發 64 KiB ×N 的記憶體分配放大。值刻意給得寬,合法情境下不會撞到。
+pub const MAX_CLIENT_ID_LEN: usize = 256;
+pub const MAX_HELLO_REASON_LEN: usize = 1024;
+pub const MAX_STREAM_TARGET_LEN: usize = 512;
+pub const MAX_STREAM_MESSAGE_LEN: usize = 1024;
+/// UDP datagram body(addr header + payload)上限。9 KiB 容得下 jumbo frame
+/// 加 SOCKS5 addr header,正常 SOCKS UDP 不會接近此值。
+pub const MAX_UDP_DATAGRAM_BODY: usize = 9216;
 
 /// Session 握手訊息（client → server），yamux 之前交換。
 #[derive(Debug, Clone)]
@@ -21,27 +34,32 @@ pub struct Hello {
 
 impl Hello {
     pub fn encode(&self) -> Vec<u8> {
+        // `client_id` length is a u16 — consistent with `HelloAck`/`StreamOpen`/
+        // `StreamReply`, and wide enough that a long identifier never truncates.
         let id = self.client_id.as_bytes();
-        let mut buf = Vec::with_capacity(4 + id.len());
+        let mut buf = Vec::with_capacity(5 + id.len());
         buf.push(self.proto_version);
         buf.extend_from_slice(&self.session_index.to_be_bytes());
-        buf.push(id.len() as u8);
+        buf.extend_from_slice(&(id.len() as u16).to_be_bytes());
         buf.extend_from_slice(id);
         buf
     }
 
     pub fn decode(buf: &[u8]) -> Result<Self, ServerError> {
-        if buf.len() < 4 {
+        if buf.len() < 5 {
             return Err(decode_err("Hello: too short"));
         }
-        let id_len = buf[3] as usize;
-        if buf.len() < 4 + id_len {
+        let id_len = u16::from_be_bytes([buf[3], buf[4]]) as usize;
+        if id_len > MAX_CLIENT_ID_LEN {
+            return Err(decode_err("Hello: client_id length exceeds limit"));
+        }
+        if buf.len() < 5 + id_len {
             return Err(decode_err("Hello: client_id incomplete"));
         }
         Ok(Hello {
             proto_version: buf[0],
             session_index: u16::from_be_bytes([buf[1], buf[2]]),
-            client_id: String::from_utf8_lossy(&buf[4..4 + id_len]).into_owned(),
+            client_id: String::from_utf8_lossy(&buf[5..5 + id_len]).into_owned(),
         })
     }
 }
@@ -68,6 +86,9 @@ impl HelloAck {
             return Err(decode_err("HelloAck: too short"));
         }
         let r_len = u16::from_be_bytes([buf[1], buf[2]]) as usize;
+        if r_len > MAX_HELLO_REASON_LEN {
+            return Err(decode_err("HelloAck: reason length exceeds limit"));
+        }
         if buf.len() < 3 + r_len {
             return Err(decode_err("HelloAck: reason incomplete"));
         }
@@ -110,6 +131,9 @@ impl StreamOpen {
                     return Err(decode_err("StreamOpen::Tcp: need target_len"));
                 }
                 let t_len = u16::from_be_bytes([buf[1], buf[2]]) as usize;
+                if t_len > MAX_STREAM_TARGET_LEN {
+                    return Err(decode_err("StreamOpen::Tcp: target length exceeds limit"));
+                }
                 if buf.len() < 3 + t_len {
                     return Err(decode_err("StreamOpen::Tcp: target incomplete"));
                 }
@@ -147,6 +171,9 @@ impl StreamReply {
             return Err(decode_err("StreamReply: too short"));
         }
         let m_len = u16::from_be_bytes([buf[1], buf[2]]) as usize;
+        if m_len > MAX_STREAM_MESSAGE_LEN {
+            return Err(decode_err("StreamReply: message length exceeds limit"));
+        }
         if buf.len() < 3 + m_len {
             return Err(decode_err("StreamReply: message incomplete"));
         }
@@ -186,6 +213,9 @@ impl UdpDatagram {
             return Ok(None);
         }
         let body_len = u16::from_be_bytes([buf[0], buf[1]]) as usize;
+        if body_len > MAX_UDP_DATAGRAM_BODY {
+            return Err(decode_err("UdpDatagram: body length exceeds limit"));
+        }
         if buf.len() < 2 + body_len {
             return Ok(None);
         }
@@ -228,6 +258,40 @@ mod tests {
     #[test]
     fn hello_decode_rejects_truncated() {
         assert!(Hello::decode(&[1, 0]).is_err());
+    }
+
+    #[test]
+    fn hello_decode_rejects_oversize_id() {
+        // u16 id_len = 65535 vastly exceeds MAX_CLIENT_ID_LEN; decode must
+        // refuse before allocating 64 KiB — defends against the
+        // length-prefix amplification attack.
+        let mut malicious = vec![PROTO_VERSION, 0, 0];
+        malicious.extend_from_slice(&u16::MAX.to_be_bytes());
+        // No body bytes — but the length cap should fire before
+        // "incomplete" too.
+        assert!(Hello::decode(&malicious).is_err());
+    }
+
+    #[test]
+    fn udp_datagram_decode_rejects_oversize_body() {
+        let mut malicious = u16::MAX.to_be_bytes().to_vec();
+        malicious.extend_from_slice(&[0u8; 16]); // some addr-ish bytes
+        let result = UdpDatagram::decode(&malicious);
+        assert!(result.is_err(), "oversize UDP datagram must be rejected");
+    }
+
+    #[test]
+    fn stream_open_decode_rejects_oversize_target() {
+        let mut malicious = vec![0x01];
+        malicious.extend_from_slice(&u16::MAX.to_be_bytes());
+        assert!(StreamOpen::decode(&malicious).is_err());
+    }
+
+    #[test]
+    fn stream_reply_decode_rejects_oversize_message() {
+        let mut malicious = vec![0];
+        malicious.extend_from_slice(&u16::MAX.to_be_bytes());
+        assert!(StreamReply::decode(&malicious).is_err());
     }
 
     #[test]

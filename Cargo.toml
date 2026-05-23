@@ -19,6 +19,7 @@ serde_json = "1"
 blake2 = "0.10"
 yamux = "0.13"
 rand = "0.9"
+futures = { version = "0.3", default-features = false, features = ["std"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

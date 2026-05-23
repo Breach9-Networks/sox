@@ -37,6 +37,10 @@ secret = "change-me"              # Shared secret for Noise encryption (server +
 # client_id = "office-node"         # Client: unique identifier
 # tunnel_sessions = 8               # Client: concurrent yamux sessions
 # max_streams_per_session = 256     # Per-session yamux stream cap
-# recv_window_mb = 64               # Per-session yamux receive window (MiB)
+# recv_window_mb = 256              # Per-session yamux receive window (MiB).
+                                    #   Must be >> max_streams_per_session × 256 KiB
+                                    #   (= 64 MiB at 256 streams) or yamux per-stream
+                                    #   BDP auto-tune has no headroom and a single
+                                    #   stream tops out at ~256 KiB / RTT.
 # reconnect_interval = 5            # Reconnect backoff base (seconds)
 # reconnect_max = 60                # Reconnect backoff cap (seconds)
