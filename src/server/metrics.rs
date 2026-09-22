@@ -32,13 +32,6 @@ impl Metrics {
         }
     }
 
-    pub fn record_relay(&self, client_to_target: u64, target_to_client: u64) {
-        self.bytes_client_to_target
-            .fetch_add(client_to_target, Ordering::Relaxed);
-        self.bytes_target_to_client
-            .fetch_add(target_to_client, Ordering::Relaxed);
-    }
-
     pub fn snapshot(&self) -> MetricsSnapshot {
         MetricsSnapshot {
             active_connections: self.active_connections.load(Ordering::Relaxed),

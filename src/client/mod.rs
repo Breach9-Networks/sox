@@ -29,9 +29,14 @@ pub struct ClientConfig {
     pub connect_timeout: Duration,
     /// Idle timeout for a relay (no data in either direction).
     pub idle_timeout: Duration,
+    /// Timeout for resolving a UDP target's domain.
+    pub dns_timeout: Duration,
+    /// On shutdown, how long in-flight relays get to finish.
+    pub drain_timeout: Duration,
 }
 
-/// Run the tunnel client until cancelled. Sessions self-heal via backoff.
+/// Run the tunnel client until cancelled, then drain. Sessions self-heal via
+/// backoff.
 pub async fn run_client(config: ClientConfig, cancel: CancellationToken) {
     tracing::info!(
         server = %config.server_addr,
@@ -52,10 +57,19 @@ pub async fn run_client(config: ClientConfig, cancel: CancellationToken) {
             reconnect_max: config.reconnect_max,
             connect_timeout: config.connect_timeout,
             idle_timeout: config.idle_timeout,
+            dns_timeout: config.dns_timeout,
+            drain_timeout: config.drain_timeout,
         },
     );
-    pool.start(cancel.clone());
+    let workers = pool.start(cancel.clone());
 
     cancel.cancelled().await;
-    tracing::info!("tunnel client shutting down");
+    tracing::info!("tunnel client shutting down, draining in-flight relays");
+    // Each worker returns once its session has drained (bounded by
+    // `drain_timeout`) — returning earlier would let the process exit and cut
+    // every in-flight relay.
+    for worker in workers {
+        let _ = worker.await;
+    }
+    tracing::info!("tunnel client stopped");
 }

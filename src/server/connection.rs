@@ -1,18 +1,19 @@
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::sync::atomic::{AtomicU64, Ordering};
 
-use socket2::SockRef;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
-use tokio_util::sync::CancellationToken;
+use tokio::time::Instant;
 
 use crate::config::Config;
 use crate::error::{ProtocolError, ServerError};
+use crate::net;
 use crate::protocol::addr::TargetAddr;
 use crate::protocol::detect::{SocksVersion, detect_version};
 use crate::protocol::socks4::{
-    Socks4Command, Socks4Reply, parse_socks4_request, write_socks4_reply,
+    Socks4Command, Socks4Reply, Socks4Request, parse_socks4_request, write_socks4_reply,
 };
-use crate::protocol::socks5::command::parse_command_request;
+use crate::protocol::socks5::command::{CommandRequest, parse_command_request};
 use crate::protocol::socks5::handshake::{
     parse_method_request, parse_userpass_request, write_method_response, write_userpass_response,
 };
@@ -21,245 +22,284 @@ use crate::protocol::socks5::{AuthMethod, ReplyCode, Socks5Command};
 use crate::relay::tcp::{relay_bidirectional, relay_tcp_live};
 use crate::relay::udp::{relay_udp, relay_udp_tunneled};
 use crate::server::ServerContext;
+use crate::server::extended_metrics::UserSessionGuard;
+use crate::tunnel::protocol::{StreamOpen, StreamReply};
+use crate::tunnel::router::{Router, TunnelStream};
 
-/// Handle a SOCKS connection — detects version (4/5) then dispatches.
-/// Handle a SOCKS connection. Returns the authenticated username (if any)
-/// so the caller can track user lifecycle in extended metrics.
+/// Longest NUL-terminated field (user id, SOCKS4a domain) accepted in a
+/// SOCKS4 request.
+const SOCKS4_MAX_FIELD: usize = 255;
+
+fn bump(counter: &AtomicU64) {
+    counter.fetch_add(1, Ordering::Relaxed);
+}
+
+/// A fully negotiated SOCKS request, ready to be served.
+enum Negotiated<'a> {
+    V5 {
+        request: CommandRequest,
+        /// Keeps the authenticated user counted as active for the whole
+        /// connection, not just the handshake.
+        _user: Option<UserSessionGuard<'a>>,
+    },
+    V4(Socks4Request),
+}
+
+/// Handle a SOCKS connection — negotiates (SOCKS4/4a/5), then serves the
+/// request.
+///
+/// The whole negotiation — version byte, method selection, authentication and
+/// the command request — shares **one** `handshake_timeout` deadline. A
+/// timeout per phase would hand a slow-loris client several times the budget.
 pub async fn handle_connection(
     stream: &mut TcpStream,
     peer_addr: SocketAddr,
     ctx: &ServerContext,
-) -> (Option<String>, Result<(), ServerError>) {
-    let config = &ctx.config;
-
-    // Read first byte to detect SOCKS version
-    let first_byte = match tokio::time::timeout(config.handshake_timeout, async {
-        let mut buf = [0u8; 1];
-        stream.read_exact(&mut buf).await?;
-        Ok::<u8, std::io::Error>(buf[0])
-    })
-    .await
-    {
-        Ok(Ok(b)) => b,
-        Ok(Err(e)) => return (None, Err(ServerError::Io(e))),
-        Err(_) => return (None, Err(ServerError::Timeout)),
-    };
-
-    match detect_version(first_byte) {
-        Some(SocksVersion::V5) => handle_socks5(stream, peer_addr, ctx, first_byte).await,
-        Some(SocksVersion::V4) => (None, handle_socks4(stream, peer_addr, ctx).await),
-        None => (
-            None,
-            Err(ServerError::Protocol(ProtocolError::InvalidVersion(first_byte))),
-        ),
-    }
-}
-
-/// Handle a SOCKS5 connection. Returns (authenticated_username, result).
-async fn handle_socks5(
-    stream: &mut TcpStream,
-    peer_addr: SocketAddr,
-    ctx: &ServerContext,
-    first_byte: u8,
-) -> (Option<String>, Result<(), ServerError>) {
-    let mut authed_user: Option<String> = None;
-    let result = handle_socks5_inner(stream, peer_addr, ctx, first_byte, &mut authed_user).await;
-    (authed_user, result)
-}
-
-async fn handle_socks5_inner(
-    stream: &mut TcpStream,
-    peer_addr: SocketAddr,
-    ctx: &ServerContext,
-    first_byte: u8,
-    authed_user: &mut Option<String>,
 ) -> Result<(), ServerError> {
-    let config = &ctx.config;
-
-    // Read remaining method negotiation bytes
-    // We already have first_byte = 0x05, now read the rest
-    let methods = tokio::time::timeout(config.handshake_timeout, async {
-        let mut header = [0u8; 1];
-        stream.read_exact(&mut header).await?;
-        let nmethods = header[0] as usize;
-
-        let mut method_buf = vec![0u8; nmethods];
-        stream.read_exact(&mut method_buf).await?;
-
-        // Reconstruct full buffer for parsing
-        let mut full = Vec::with_capacity(2 + nmethods);
-        full.push(first_byte);
-        full.push(header[0]);
-        full.extend_from_slice(&method_buf);
-
-        parse_method_request(&full).map_err(ServerError::Protocol)
-    })
-    .await
-    .map_err(|_| ServerError::Timeout)??;
-
-    // Select auth method based on server config
-    let requires_auth = ctx.auth.is_some();
-
-    let selected = if requires_auth {
-        if methods.contains(&AuthMethod::UsernamePassword) {
-            AuthMethod::UsernamePassword
-        } else {
-            let mut reply = Vec::new();
-            write_method_response(AuthMethod::NoAcceptable, &mut reply);
-            stream.write_all(&reply).await?;
-            return Err(ServerError::Protocol(ProtocolError::NoAcceptableMethod));
-        }
-    } else if methods.contains(&AuthMethod::None) {
-        AuthMethod::None
-    } else {
-        let mut reply = Vec::new();
-        write_method_response(AuthMethod::NoAcceptable, &mut reply);
-        stream.write_all(&reply).await?;
-        return Err(ServerError::Protocol(ProtocolError::NoAcceptableMethod));
-    };
-
-    let mut reply = Vec::new();
-    write_method_response(selected, &mut reply);
-    stream.write_all(&reply).await?;
-
-    // Username/password subnegotiation (RFC 1929)
-    if selected == AuthMethod::UsernamePassword {
-        let auth_result = tokio::time::timeout(config.handshake_timeout, async {
-            // Read until the full RFC 1929 request is available — it may arrive
-            // split across multiple TCP segments.
-            let mut buf = Vec::with_capacity(513);
-            let mut chunk = [0u8; 513];
-            loop {
-                let n = stream.read(&mut chunk).await?;
-                if n == 0 {
-                    return Err(ServerError::Io(std::io::Error::new(
-                        std::io::ErrorKind::UnexpectedEof,
-                        "client closed during auth",
-                    )));
-                }
-                buf.extend_from_slice(&chunk[..n]);
-                match parse_userpass_request(&buf) {
-                    Ok(creds) => return Ok(creds),
-                    Err(ProtocolError::Incomplete { .. }) if buf.len() <= 4096 => continue,
-                    Err(e) => return Err(ServerError::Protocol(e)),
-                }
-            }
-        })
+    let deadline = Instant::now() + ctx.config.handshake_timeout;
+    let negotiated = tokio::time::timeout_at(deadline, negotiate(stream, peer_addr, ctx))
         .await
         .map_err(|_| ServerError::Timeout)??;
 
-        let (username, password) = auth_result;
-        let provider = ctx.auth.as_ref().unwrap();
-        let authenticated = provider.authenticate(&username, &password);
+    match negotiated {
+        Negotiated::V5 { request, _user } => {
+            tracing::debug!(
+                %peer_addr,
+                command = ?request.command,
+                target = %request.target,
+                "SOCKS5 request"
+            );
+            match request.command {
+                Socks5Command::Connect => {
+                    handle_connect(stream, peer_addr, &request.target, ctx).await
+                }
+                Socks5Command::UdpAssociate => handle_udp_associate(stream, peer_addr, ctx).await,
+                Socks5Command::Bind => {
+                    reply_socks5_failure(stream, ReplyCode::CommandNotSupported).await;
+                    Err(ServerError::CommandNotSupported)
+                }
+            }
+        }
+        Negotiated::V4(request) => {
+            tracing::debug!(
+                %peer_addr,
+                command = ?request.command,
+                target = %request.target,
+                user_id = %request.user_id,
+                "SOCKS4 request"
+            );
+            match request.command {
+                Socks4Command::Connect => {
+                    handle_socks4_connect(stream, peer_addr, &request.target, ctx).await
+                }
+                Socks4Command::Bind => {
+                    let mut reply = Vec::new();
+                    write_socks4_reply(Socks4Reply::Rejected, None, &mut reply);
+                    stream.write_all(&reply).await?;
+                    Err(ServerError::CommandNotSupported)
+                }
+            }
+        }
+    }
+}
 
+/// Detect the SOCKS version and run that version's negotiation.
+///
+/// Every read is **exact** — sized from the protocol's own length fields, or
+/// up to a NUL terminator. Nothing past the request is consumed, so a client
+/// that pipelines payload right behind its request loses no bytes; and a
+/// request split across TCP segments is simply read in several steps.
+async fn negotiate<'a>(
+    stream: &mut TcpStream,
+    peer_addr: SocketAddr,
+    ctx: &'a ServerContext,
+) -> Result<Negotiated<'a>, ServerError> {
+    let version = stream.read_u8().await?;
+    match detect_version(version) {
+        Some(SocksVersion::V5) => negotiate_socks5(stream, peer_addr, ctx, version).await,
+        Some(SocksVersion::V4) => Ok(Negotiated::V4(read_socks4_request(stream).await?)),
+        None => Err(ServerError::Protocol(ProtocolError::InvalidVersion(version))),
+    }
+}
+
+async fn negotiate_socks5<'a>(
+    stream: &mut TcpStream,
+    peer_addr: SocketAddr,
+    ctx: &'a ServerContext,
+    version: u8,
+) -> Result<Negotiated<'a>, ServerError> {
+    // Method negotiation: [version, nmethods, methods…] — version already read.
+    let mut greeting = [0u8; 2 + 255];
+    greeting[0] = version;
+    greeting[1] = stream.read_u8().await?;
+    let end = 2 + greeting[1] as usize;
+    stream.read_exact(&mut greeting[2..end]).await?;
+    let methods = parse_method_request(&greeting[..end])?;
+
+    // Select auth method based on server config
+    let wanted = match ctx.auth {
+        Some(_) => AuthMethod::UsernamePassword,
+        None => AuthMethod::None,
+    };
+    let selected = if methods.contains(&wanted) {
+        wanted
+    } else {
+        AuthMethod::NoAcceptable
+    };
+    let mut reply = Vec::new();
+    write_method_response(selected, &mut reply);
+    stream.write_all(&reply).await?;
+    if selected == AuthMethod::NoAcceptable {
+        return Err(ServerError::Protocol(ProtocolError::NoAcceptableMethod));
+    }
+
+    // Username/password subnegotiation (RFC 1929):
+    // [version, ulen, uname…, plen, passwd…]
+    let mut user_guard = None;
+    if let Some(provider) = &ctx.auth {
+        let mut auth = [0u8; 3 + 255 + 255];
+        stream.read_exact(&mut auth[..2]).await?;
+        let plen_at = 2 + auth[1] as usize;
+        stream.read_exact(&mut auth[2..=plen_at]).await?;
+        let end = plen_at + 1 + auth[plen_at] as usize;
+        stream.read_exact(&mut auth[plen_at + 1..end]).await?;
+        let (username, password) = parse_userpass_request(&auth[..end])?;
+
+        let authenticated = provider.authenticate(&username, &password);
         let mut reply = Vec::new();
         write_userpass_response(authenticated, &mut reply);
         stream.write_all(&reply).await?;
 
         if !authenticated {
             tracing::debug!(%peer_addr, %username, "authentication failed");
+            bump(&ctx.extended_metrics.errors_auth_rejected);
             return Err(ServerError::Protocol(ProtocolError::NoAcceptableMethod));
         }
-
-        *authed_user = Some(username.clone());
         tracing::debug!(%peer_addr, %username, "authenticated");
+        user_guard = Some(ctx.extended_metrics.user_session(&username));
     }
 
-    // Command request — read until the full request is available; it may
-    // arrive split across multiple TCP segments.
-    let cmd_request = tokio::time::timeout(config.handshake_timeout, async {
-        let mut buf = Vec::with_capacity(262);
-        let mut chunk = [0u8; 262];
-        loop {
-            let n = stream.read(&mut chunk).await?;
-            if n == 0 {
-                return Err(ServerError::Io(std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
-                    "client closed during command",
-                )));
-            }
-            buf.extend_from_slice(&chunk[..n]);
-            match parse_command_request(&buf) {
-                Ok((req, _)) => return Ok(req),
-                Err(ProtocolError::Incomplete { .. }) if buf.len() <= 4096 => continue,
-                Err(e) => return Err(ServerError::Protocol(e)),
-            }
+    // Command request: [version, cmd, rsv, atyp, addr…, port(2)]
+    let mut cmd = [0u8; 4 + 1 + 255 + 2];
+    stream.read_exact(&mut cmd[..4]).await?;
+    let end = match cmd[3] {
+        0x01 => 4 + 4 + 2,
+        0x04 => 4 + 16 + 2,
+        0x03 => {
+            cmd[4] = stream.read_u8().await?;
+            5 + cmd[4] as usize + 2
         }
-    })
-    .await
-    .map_err(|_| ServerError::Timeout)??;
+        other => return Err(ServerError::Protocol(ProtocolError::InvalidAddressType(other))),
+    };
+    let already = if cmd[3] == 0x03 { 5 } else { 4 };
+    stream.read_exact(&mut cmd[already..end]).await?;
+    let (request, _) = parse_command_request(&cmd[..end])?;
 
-    tracing::debug!(
-        %peer_addr,
-        command = ?cmd_request.command,
-        target = %cmd_request.target,
-        "SOCKS5 request"
-    );
+    Ok(Negotiated::V5 { request, _user: user_guard })
+}
 
-    match cmd_request.command {
-        Socks5Command::Connect => {
-            handle_connect(stream, peer_addr, &cmd_request.target, ctx).await
+/// Read a SOCKS4/4a request. The version byte (0x04) has already been consumed.
+///
+/// Format: `[cmd, port(2), ip(4), userid… NUL]`, plus `[domain… NUL]` for
+/// SOCKS4a (ip = 0.0.0.x, x != 0).
+async fn read_socks4_request(stream: &mut TcpStream) -> Result<Socks4Request, ServerError> {
+    let mut buf = vec![0u8; 7];
+    stream.read_exact(&mut buf).await?;
+    let is_socks4a = buf[3..6] == [0, 0, 0] && buf[6] != 0;
+
+    read_through_nul(stream, &mut buf).await?; // user id
+    if is_socks4a {
+        read_through_nul(stream, &mut buf).await?; // domain
+    }
+    let (request, _) = parse_socks4_request(&buf)?;
+    Ok(request)
+}
+
+/// Append bytes from `stream` to `out` up to and including the next NUL —
+/// and not one byte further. `peek` shows what has arrived; exactly the part
+/// up to the terminator is then consumed, so this costs two syscalls per TCP
+/// segment rather than one per byte.
+async fn read_through_nul(stream: &mut TcpStream, out: &mut Vec<u8>) -> std::io::Result<()> {
+    let mut window = [0u8; SOCKS4_MAX_FIELD + 1];
+    let mut field_len = 0;
+    loop {
+        let room = SOCKS4_MAX_FIELD + 1 - field_len;
+        if room == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "SOCKS4 field too long",
+            ));
         }
-        Socks5Command::UdpAssociate => {
-            handle_udp_associate(stream, peer_addr, ctx).await
+        let peeked = stream.peek(&mut window[..room]).await?;
+        if peeked == 0 {
+            return Err(std::io::ErrorKind::UnexpectedEof.into());
         }
-        Socks5Command::Bind => {
-            let mut reply = Vec::new();
-            write_command_reply(
-                ReplyCode::CommandNotSupported,
-                &TargetAddr::unspecified(),
-                &mut reply,
-            );
-            stream.write_all(&reply).await?;
-            Err(ServerError::CommandNotSupported)
+        let nul = window[..peeked].iter().position(|&b| b == 0);
+        let take = nul.map_or(peeked, |i| i + 1);
+        stream.read_exact(&mut window[..take]).await?;
+        out.extend_from_slice(&window[..take]);
+        field_len += take;
+        if nul.is_some() {
+            return Ok(());
         }
     }
 }
 
-/// Handle a SOCKS4/4a connection. Version byte (0x04) has already been consumed.
-async fn handle_socks4(
-    stream: &mut TcpStream,
-    peer_addr: SocketAddr,
-    ctx: &ServerContext,
-) -> Result<(), ServerError> {
+/// Resolve and dial a CONNECT target (standalone mode), with keepalive set.
+async fn dial(target: &TargetAddr, ctx: &ServerContext) -> Result<TcpStream, ServerError> {
     let config = &ctx.config;
-
-    // Read the rest of the SOCKS4 request
-    let request = tokio::time::timeout(config.handshake_timeout, async {
-        // SOCKS4 requests are variable length, read a generous chunk
-        let mut buf = [0u8; 512];
-        let n = stream.read(&mut buf).await?;
-        if n == 0 {
-            return Err(ServerError::Io(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                "client closed during SOCKS4 request",
-            )));
+    let addrs = match resolve_target(target, config).await {
+        Ok(addrs) => addrs,
+        Err(e) => {
+            bump(&ctx.extended_metrics.errors_dns_timeout);
+            return Err(e);
         }
-        let (req, _) = parse_socks4_request(&buf[..n]).map_err(ServerError::Protocol)?;
-        Ok(req)
-    })
-    .await
-    .map_err(|_| ServerError::Timeout)??;
-
-    tracing::debug!(
-        %peer_addr,
-        command = ?request.command,
-        target = %request.target,
-        user_id = %request.user_id,
-        "SOCKS4 request"
-    );
-
-    match request.command {
-        Socks4Command::Connect => {
-            handle_socks4_connect(stream, peer_addr, &request.target, ctx).await
+    };
+    match net::connect_any(&addrs, config.connect_timeout).await {
+        Ok(stream) => {
+            net::configure_stream(&stream, &config.keepalive())?;
+            Ok(stream)
         }
-        Socks4Command::Bind => {
-            let mut reply = Vec::new();
-            write_socks4_reply(Socks4Reply::Rejected, None, &mut reply);
-            stream.write_all(&reply).await?;
-            Err(ServerError::CommandNotSupported)
+        Err(e) => {
+            bump(&ctx.extended_metrics.errors_connection_failed);
+            Err(if e.kind() == std::io::ErrorKind::TimedOut {
+                ServerError::Timeout
+            } else {
+                ServerError::Io(e)
+            })
         }
     }
+}
+
+/// Relay between the SOCKS client and a directly-dialed target.
+///
+/// `idle_timeout` is enforced inside the relay as a true inactivity timer,
+/// not a wall-clock cap — an actively transferring connection is not cut.
+/// Live counters mean bytes are already in the global metrics; the returned
+/// counts are only used for the log line.
+async fn relay_direct(
+    stream: &mut TcpStream,
+    target_stream: &mut TcpStream,
+    peer_addr: SocketAddr,
+    target: &TargetAddr,
+    ctx: &ServerContext,
+) -> Result<(), ServerError> {
+    let (c2s, s2c, outcome) = relay_tcp_live(
+        stream,
+        target_stream,
+        &[&ctx.metrics.bytes_client_to_target],
+        &[&ctx.metrics.bytes_target_to_client],
+        Some(ctx.config.idle_timeout),
+    )
+    .await;
+
+    if let Err(e) = outcome {
+        bump(&ctx.extended_metrics.errors_relay);
+        tracing::debug!(%peer_addr, %target, c2s, s2c, error = %e, "relay error");
+        return Err(ServerError::Io(e));
+    }
+    tracing::debug!(%peer_addr, %target, c2s, s2c, "relay finished");
+    Ok(())
 }
 
 /// Handle SOCKS4 CONNECT.
@@ -269,27 +309,15 @@ async fn handle_socks4_connect(
     target: &TargetAddr,
     ctx: &ServerContext,
 ) -> Result<(), ServerError> {
-    let config = &ctx.config;
-    let target_addr = resolve_target(target, config).await?;
-
-    let mut target_stream =
-        match tokio::time::timeout(config.connect_timeout, TcpStream::connect(target_addr)).await {
-            Ok(Ok(s)) => s,
-            Ok(Err(e)) => {
-                let mut reply = Vec::new();
-                write_socks4_reply(Socks4Reply::Rejected, None, &mut reply);
-                stream.write_all(&reply).await?;
-                return Err(ServerError::Io(e));
-            }
-            Err(_) => {
-                let mut reply = Vec::new();
-                write_socks4_reply(Socks4Reply::Rejected, None, &mut reply);
-                stream.write_all(&reply).await?;
-                return Err(ServerError::Timeout);
-            }
-        };
-
-    configure_target_socket(&target_stream, config)?;
+    let mut target_stream = match dial(target, ctx).await {
+        Ok(s) => s,
+        Err(e) => {
+            let mut reply = Vec::new();
+            write_socks4_reply(Socks4Reply::Rejected, None, &mut reply);
+            let _ = stream.write_all(&reply).await;
+            return Err(e);
+        }
+    };
 
     // SOCKS4 reply with bound address
     let bind_v4 = target_stream
@@ -305,31 +333,8 @@ async fn handle_socks4_connect(
     write_socks4_reply(Socks4Reply::Granted, Some(bind_v4), &mut reply);
     stream.write_all(&reply).await?;
 
-    tracing::debug!(
-        %peer_addr,
-        %target,
-        "SOCKS4 CONNECT established, starting relay"
-    );
-
-    // `idle_timeout` is enforced inside the relay as a true inactivity timer,
-    // not a wall-clock cap — an actively transferring connection is not cut.
-    // Live counters mean bytes are already in the global metrics; the
-    // returned tuple is only used for the log line + error propagation.
-    let (c2s, s2c, outcome) = relay_tcp_live(
-        stream,
-        &mut target_stream,
-        Some(&ctx.metrics.bytes_client_to_target),
-        Some(&ctx.metrics.bytes_target_to_client),
-        Some(config.idle_timeout),
-    )
-    .await;
-
-    if let Err(e) = outcome {
-        tracing::debug!(%peer_addr, %target, c2s, s2c, error = %e, "SOCKS4 relay error");
-        return Err(ServerError::Io(e));
-    }
-    tracing::debug!(%peer_addr, %target, c2s, s2c, "SOCKS4 relay finished");
-    Ok(())
+    tracing::debug!(%peer_addr, %target, "SOCKS4 CONNECT established, starting relay");
+    relay_direct(stream, &mut target_stream, peer_addr, target, ctx).await
 }
 
 /// Handle SOCKS5 CONNECT command.
@@ -346,36 +351,13 @@ async fn handle_connect(
     }
 
     // Standalone mode: connect directly
-    let config = &ctx.config;
-    let target_addr = resolve_target(target, config).await?;
-
-    let mut target_stream =
-        match tokio::time::timeout(config.connect_timeout, TcpStream::connect(target_addr)).await {
-            Ok(Ok(stream)) => stream,
-            Ok(Err(e)) => {
-                let code = match e.kind() {
-                    std::io::ErrorKind::ConnectionRefused => ReplyCode::ConnectionRefused,
-                    std::io::ErrorKind::AddrNotAvailable => ReplyCode::HostUnreachable,
-                    _ => ReplyCode::GeneralFailure,
-                };
-                let mut reply = Vec::new();
-                write_command_reply(code, &TargetAddr::unspecified(), &mut reply);
-                stream.write_all(&reply).await?;
-                return Err(ServerError::Io(e));
-            }
-            Err(_) => {
-                let mut reply = Vec::new();
-                write_command_reply(
-                    ReplyCode::TtlExpired,
-                    &TargetAddr::unspecified(),
-                    &mut reply,
-                );
-                stream.write_all(&reply).await?;
-                return Err(ServerError::Timeout);
-            }
-        };
-
-    configure_target_socket(&target_stream, config)?;
+    let mut target_stream = match dial(target, ctx).await {
+        Ok(s) => s,
+        Err(e) => {
+            reply_socks5_failure(stream, e.to_reply_code()).await;
+            return Err(e);
+        }
+    };
 
     let bind_addr = match target_stream.local_addr() {
         Ok(addr) => TargetAddr::Ip(addr),
@@ -389,26 +371,124 @@ async fn handle_connect(
         %peer_addr, %target, bind = %bind_addr,
         "CONNECT established, starting relay"
     );
+    relay_direct(stream, &mut target_stream, peer_addr, target, ctx).await
+}
 
-    // `idle_timeout` is enforced inside the relay as a true inactivity timer,
-    // not a wall-clock cap — an actively transferring connection is not cut.
-    // Live counters mean bytes are already in the global metrics; the
-    // returned tuple is only used for the log line + error propagation.
-    let (c2s, s2c, outcome) = relay_tcp_live(
-        stream,
-        &mut target_stream,
-        Some(&ctx.metrics.bytes_client_to_target),
-        Some(&ctx.metrics.bytes_target_to_client),
-        Some(config.idle_timeout),
-    )
-    .await;
+// ───────────────────────── tunnel mode ─────────────────────────
 
-    if let Err(e) = outcome {
-        tracing::debug!(%peer_addr, %target, c2s, s2c, error = %e, "relay error");
-        return Err(ServerError::Io(e));
+type TunnelIo = tokio_util::compat::Compat<yamux::Stream>;
+
+/// How much longer than `connect_timeout` the server waits for the tunnel
+/// client's `StreamReply`. The client spends up to `connect_timeout` dialing
+/// and then *reports* a timeout itself; without slack the two timers race and
+/// the client's more specific reply code is lost.
+const TUNNEL_REPLY_SLACK: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Attempts at opening a tunnel flow. A session can die between "stream
+/// opened" and "reply received"; nothing has been sent to the target yet, so
+/// trying once more on another session is safe.
+const TUNNEL_OPEN_ATTEMPTS: usize = 2;
+
+/// An opened tunnel flow: the stream, the owning client's live byte counters
+/// and the client's (successful or not) reply to our `StreamOpen`.
+struct TunnelFlow {
+    io: TunnelIo,
+    tx_bytes: std::sync::Arc<AtomicU64>,
+    rx_bytes: std::sync::Arc<AtomicU64>,
+    reply: StreamReply,
+}
+
+/// Open a yamux stream to a tunnel client, send `open`, await its reply.
+/// Every step is time-bounded — a wedged session must not hang the SOCKS
+/// client. On failure returns the SOCKS5 reply code to fail the client with.
+async fn open_tunnel_flow(
+    router: &Router,
+    open: &StreamOpen,
+    config: &Config,
+) -> Result<TunnelFlow, (ReplyCode, ServerError)> {
+    use tokio_util::compat::FuturesAsyncReadCompatExt;
+
+    let preamble = open.encode();
+    let mut last_err = None;
+
+    for _ in 0..TUNNEL_OPEN_ATTEMPTS {
+        let Some(TunnelStream { stream, tx_bytes, rx_bytes }) =
+            router.open_stream(None, config.connect_timeout).await
+        else {
+            break;
+        };
+        let mut io = stream.compat();
+
+        let exchange = async {
+            io.write_all(&preamble).await?;
+            StreamReply::read_from(&mut io).await
+        };
+        match tokio::time::timeout(config.connect_timeout + TUNNEL_REPLY_SLACK, exchange).await {
+            Ok(Ok(reply)) => return Ok(TunnelFlow { io, tx_bytes, rx_bytes, reply }),
+            Ok(Err(e)) => {
+                tracing::debug!(error = %e, "tunnel stream died before its reply, retrying");
+                last_err = Some((ReplyCode::GeneralFailure, ServerError::Io(e)));
+            }
+            // The client had its full dial budget — do not double it.
+            Err(_) => return Err((ReplyCode::TtlExpired, ServerError::Timeout)),
+        }
     }
-    tracing::debug!(%peer_addr, %target, c2s, s2c, "relay finished");
-    Ok(())
+
+    Err(last_err.unwrap_or_else(|| {
+        log_no_tunnel_clients();
+        (
+            ReplyCode::GeneralFailure,
+            ServerError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                "no tunnel clients available",
+            )),
+        )
+    }))
+}
+
+/// Rate-limit the "no tunnel clients" warning: log once on transition, not per
+/// request.
+static NO_CLIENTS_LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn log_no_tunnel_clients() {
+    if !NO_CLIENTS_LOGGED.swap(true, Ordering::Relaxed) {
+        tracing::warn!("no tunnel clients available (suppressing further warnings)");
+    }
+}
+
+fn log_tunnel_clients_back() {
+    if NO_CLIENTS_LOGGED.swap(false, Ordering::Relaxed) {
+        tracing::info!("tunnel client available again");
+    }
+}
+
+/// Open a tunnel flow for `open` and turn anything but a successful reply
+/// into a SOCKS5 failure reply — the client is still blocked waiting for one.
+async fn open_tunnel_flow_or_reply(
+    stream: &mut TcpStream,
+    open: &StreamOpen,
+    ctx: &ServerContext,
+    router: &Router,
+) -> Result<TunnelFlow, ServerError> {
+    let flow = match open_tunnel_flow(router, open, &ctx.config).await {
+        Ok(flow) => flow,
+        Err((code, e)) => {
+            bump(&ctx.extended_metrics.errors_connection_failed);
+            reply_socks5_failure(stream, code).await;
+            return Err(e);
+        }
+    };
+    log_tunnel_clients_back();
+
+    if flow.reply.status != 0 {
+        bump(&ctx.extended_metrics.errors_connection_failed);
+        reply_socks5_failure(stream, ReplyCode::from_u8(flow.reply.status)).await;
+        return Err(ServerError::Io(std::io::Error::new(
+            std::io::ErrorKind::ConnectionRefused,
+            flow.reply.message,
+        )));
+    }
+    Ok(flow)
 }
 
 /// Handle SOCKS5 CONNECT via a tunnel client (yamux multiplexed).
@@ -417,85 +497,12 @@ async fn handle_connect_via_tunnel(
     peer_addr: SocketAddr,
     target: &TargetAddr,
     ctx: &ServerContext,
-    router: &std::sync::Arc<crate::tunnel::router::Router>,
+    router: &Router,
 ) -> Result<(), ServerError> {
-    use crate::tunnel::protocol::{StreamOpen, StreamReply};
-    use std::sync::atomic::{AtomicBool, Ordering as AtomOrd};
-    use tokio_util::compat::FuturesAsyncReadCompatExt;
-
-    // Rate-limit "no tunnel clients" warning: log once on transition, not per-request
-    static NO_CLIENTS_LOGGED: AtomicBool = AtomicBool::new(false);
-
-    let config = &ctx.config;
-    let target_str = target.to_string();
-
-    // Open a fresh yamux stream on one of the tunnel client's sessions.
-    let tunnel = match router.open_stream(None).await {
-        Some(t) => {
-            if NO_CLIENTS_LOGGED.swap(false, AtomOrd::Relaxed) {
-                tracing::info!("tunnel client available again");
-            }
-            t
-        }
-        None => {
-            if !NO_CLIENTS_LOGGED.swap(true, AtomOrd::Relaxed) {
-                tracing::warn!("no tunnel clients available (suppressing further warnings)");
-            }
-            let mut reply = Vec::new();
-            write_command_reply(
-                ReplyCode::GeneralFailure,
-                &TargetAddr::unspecified(),
-                &mut reply,
-            );
-            stream.write_all(&reply).await?;
-            return Err(ServerError::Io(std::io::Error::new(
-                std::io::ErrorKind::NotConnected,
-                "no tunnel clients available",
-            )));
-        }
-    };
-
-    let crate::tunnel::router::TunnelStream { stream: yamux_stream, tx_bytes, rx_bytes } = tunnel;
-    let mut tunnel_io = yamux_stream.compat();
-
     tracing::debug!(%peer_addr, %target, "routing CONNECT through tunnel");
 
-    // Write the StreamOpen preamble, then read the client's StreamReply.
-    // On any failure here the SOCKS client is still blocked waiting for its
-    // CONNECT reply — send one before returning so it fails fast with a code.
-    let preamble = StreamOpen::Tcp { target: target_str }.encode();
-    if let Err(e) = tunnel_io.write_all(&preamble).await {
-        reply_socks5_failure(stream, ReplyCode::GeneralFailure).await;
-        return Err(ServerError::Io(e));
-    }
-
-    let reply: StreamReply =
-        match tokio::time::timeout(config.connect_timeout, read_stream_reply(&mut tunnel_io)).await {
-            Ok(Ok(r)) => r,
-            Ok(Err(e)) => {
-                reply_socks5_failure(stream, ReplyCode::GeneralFailure).await;
-                return Err(ServerError::Io(e));
-            }
-            Err(_) => {
-                reply_socks5_failure(stream, ReplyCode::TtlExpired).await;
-                return Err(ServerError::Timeout);
-            }
-        };
-
-    if reply.status != 0 {
-        tracing::debug!(%peer_addr, %target, reason = %reply.message, "tunnel client connect failed");
-        let mut buf = Vec::new();
-        write_command_reply(
-            ReplyCode::from_u8(reply.status),
-            &TargetAddr::unspecified(),
-            &mut buf,
-        );
-        stream.write_all(&buf).await?;
-        return Err(ServerError::Io(std::io::Error::new(
-            std::io::ErrorKind::ConnectionRefused,
-            reply.message,
-        )));
-    }
+    let open = StreamOpen::Tcp { target: target.to_string() };
+    let mut flow = open_tunnel_flow_or_reply(stream, &open, ctx, router).await?;
 
     // Success — reply to the SOCKS client, then relay.
     let mut buf = Vec::new();
@@ -504,23 +511,20 @@ async fn handle_connect_via_tunnel(
 
     tracing::debug!(%peer_addr, %target, "tunnel CONNECT established, starting relay");
 
-    // "tx" = SOCKS client -> target ; "rx" = target -> SOCKS client.
-    // `idle_timeout` is enforced inside the relay as a true inactivity timer;
-    // byte counts are returned unconditionally so the global metrics below
-    // are updated even when the relay ends on an error or idle stop.
+    // "tx" = SOCKS client -> target ; "rx" = target -> SOCKS client. Both the
+    // per-client and the global counters are bumped live, so the dashboard's
+    // traffic chart moves during a long transfer, not only when it ends.
     let (c2s, s2c, outcome) = relay_bidirectional(
         stream,
-        &mut tunnel_io,
-        Some(tx_bytes.as_ref()),
-        Some(rx_bytes.as_ref()),
-        Some(config.idle_timeout),
+        &mut flow.io,
+        &[&ctx.metrics.bytes_client_to_target, &flow.tx_bytes],
+        &[&ctx.metrics.bytes_target_to_client, &flow.rx_bytes],
+        Some(ctx.config.idle_timeout),
     )
     .await;
 
-    ctx.metrics.bytes_client_to_target.fetch_add(c2s, AtomOrd::Relaxed);
-    ctx.metrics.bytes_target_to_client.fetch_add(s2c, AtomOrd::Relaxed);
-
     if let Err(e) = outcome {
+        bump(&ctx.extended_metrics.errors_relay);
         tracing::debug!(%peer_addr, %target, c2s, s2c, error = %e, "tunnel relay error");
         return Err(ServerError::Io(e));
     }
@@ -528,30 +532,16 @@ async fn handle_connect_via_tunnel(
     Ok(())
 }
 
-/// Read a `StreamReply` preamble exactly off a tunnel stream (no over-read).
-async fn read_stream_reply<S>(s: &mut S) -> std::io::Result<crate::tunnel::protocol::StreamReply>
-where
-    S: tokio::io::AsyncRead + Unpin,
-{
-    let mut head = [0u8; 3];
-    s.read_exact(&mut head).await?;
-    let msg_len = u16::from_be_bytes([head[1], head[2]]) as usize;
-    let mut msg = vec![0u8; msg_len];
-    s.read_exact(&mut msg).await?;
-    Ok(crate::tunnel::protocol::StreamReply {
-        status: head[0],
-        message: String::from_utf8_lossy(&msg).into_owned(),
-    })
-}
-
 /// Send a SOCKS5 command reply carrying `code` to the client, ignoring any
-/// write error. Used on tunnel CONNECT error paths so the client fails fast
-/// with a proper reply code instead of waiting on a silently-closed socket.
+/// write error. Used on error paths so the client fails fast with a proper
+/// reply code instead of waiting on a silently-closed socket.
 async fn reply_socks5_failure(stream: &mut TcpStream, code: ReplyCode) {
     let mut buf = Vec::new();
     write_command_reply(code, &TargetAddr::unspecified(), &mut buf);
     let _ = stream.write_all(&buf).await;
 }
+
+// ───────────────────────── UDP ASSOCIATE ─────────────────────────
 
 /// Handle SOCKS5 UDP ASSOCIATE command.
 ///
@@ -561,194 +551,70 @@ async fn reply_socks5_failure(stream: &mut TcpStream, code: ReplyCode) {
 /// dropped (e.g., when no tunnel client is available). Standalone mode can
 /// reply immediately because the relay is local and always usable once
 /// bind succeeds.
+///
+/// The association lives as long as the TCP control connection (RFC 1928),
+/// bounded by `idle_timeout` as a true inactivity timer. The relay borrows
+/// the control stream and spawns nothing, so returning from here releases
+/// every socket of the association.
 async fn handle_udp_associate(
     stream: &mut TcpStream,
     peer_addr: SocketAddr,
     ctx: &ServerContext,
 ) -> Result<(), ServerError> {
-    // Bind a UDP relay socket for the SOCKS client to send datagrams to.
-    let relay_socket = UdpSocket::bind("0.0.0.0:0").await?;
+    // Bind the relay socket on the address the client reached us at: same
+    // address family as the client, and a BND.ADDR it can actually send to
+    // (0.0.0.0 is not one). A dual-stack listener reports a v4 client's local
+    // address as v4-mapped — canonicalize so such a client gets a v4 socket.
+    let local_ip = stream.local_addr()?.ip().to_canonical();
+    let relay_socket = UdpSocket::bind((local_ip, 0)).await?;
     let relay_addr = relay_socket.local_addr()?;
+    let bind_addr = TargetAddr::Ip(relay_addr);
 
     tracing::debug!(%peer_addr, relay = %relay_addr, "UDP ASSOCIATE relay bound");
 
-    // When the TCP control stream closes, the UDP relay must stop.
-    let cancel = CancellationToken::new();
+    let idle_timeout = ctx.config.idle_timeout;
+    let outcome = match &ctx.router {
+        // Tunnel mode: open the tunnel UDP stream FIRST, then reply.
+        Some(router) => {
+            let flow = open_tunnel_flow_or_reply(stream, &StreamOpen::Udp, ctx, router).await?;
+            let mut reply = Vec::new();
+            write_command_reply(ReplyCode::Succeeded, &bind_addr, &mut reply);
+            stream.write_all(&reply).await?;
+            tracing::debug!(%peer_addr, "UDP ASSOCIATE routed through tunnel");
 
-    // Duplicate the TCP stream FD so the relay can monitor it for closure
-    // while the original stays valid.
-    let tcp_control = {
-        let sock_ref = SockRef::from(&*stream);
-        let dup_socket = sock_ref.try_clone()?;
-        TcpStream::from_std(std::net::TcpStream::from(dup_socket))?
-    };
-
-    // Tunnel mode: open the tunnel UDP stream FIRST, then reply.
-    if let Some(router) = &ctx.router {
-        return handle_udp_associate_via_tunnel(
-            stream, peer_addr, relay_addr, relay_socket, tcp_control, ctx, router, cancel,
-        )
-        .await;
-    }
-
-    // Standalone mode: relay is local, safe to reply immediately.
-    let bind_addr = TargetAddr::Ip(relay_addr);
-    let mut reply = Vec::new();
-    write_command_reply(ReplyCode::Succeeded, &bind_addr, &mut reply);
-    stream.write_all(&reply).await?;
-
-    let relay_result = tokio::time::timeout(
-        ctx.config.idle_timeout,
-        relay_udp(tcp_control, relay_socket, peer_addr.ip(), cancel),
-    )
-    .await;
-
-    match relay_result {
-        Ok(Ok(())) => {
-            tracing::debug!(%peer_addr, "UDP ASSOCIATE relay finished");
-            Ok(())
+            relay_udp_tunneled(stream, relay_socket, peer_addr.ip(), flow.io, idle_timeout).await
         }
-        Ok(Err(e)) => Err(ServerError::Io(e)),
-        Err(_) => Err(ServerError::Timeout),
-    }
-}
-
-/// Route a UDP ASSOCIATE session through a tunnel client over a yamux stream.
-///
-/// The SOCKS5 success reply is sent **only after** the tunnel UDP stream is
-/// open and the client's StreamReply confirms readiness; any failure before
-/// then is reported via `reply_socks5_failure` so the SOCKS client fails
-/// fast with a proper reply code instead of getting a useless relay_addr.
-#[allow(clippy::too_many_arguments)]
-async fn handle_udp_associate_via_tunnel(
-    stream: &mut TcpStream,
-    peer_addr: SocketAddr,
-    relay_addr: SocketAddr,
-    relay_socket: UdpSocket,
-    tcp_control: TcpStream,
-    ctx: &ServerContext,
-    router: &std::sync::Arc<crate::tunnel::router::Router>,
-    cancel: CancellationToken,
-) -> Result<(), ServerError> {
-    use crate::tunnel::protocol::StreamOpen;
-    use tokio_util::compat::FuturesAsyncReadCompatExt;
-
-    let tunnel = match router.open_stream(None).await {
-        Some(t) => t,
+        // Standalone mode: relay is local, safe to reply immediately.
         None => {
-            reply_socks5_failure(stream, ReplyCode::GeneralFailure).await;
-            return Err(ServerError::Io(std::io::Error::new(
-                std::io::ErrorKind::NotConnected,
-                "no tunnel clients available",
-            )));
+            let mut reply = Vec::new();
+            write_command_reply(ReplyCode::Succeeded, &bind_addr, &mut reply);
+            stream.write_all(&reply).await?;
+
+            let dns_timeout = ctx.config.dns_timeout;
+            relay_udp(stream, relay_socket, peer_addr.ip(), idle_timeout, dns_timeout).await
         }
     };
-    let mut tunnel_io = tunnel.stream.compat();
 
-    // Open a UDP stream: write the preamble, await the client's reply.
-    // On any failure here send a SOCKS5 failure reply before returning —
-    // the client is still blocked waiting for the UDP ASSOCIATE reply.
-    if let Err(e) = tunnel_io.write_all(&StreamOpen::Udp.encode()).await {
-        reply_socks5_failure(stream, ReplyCode::GeneralFailure).await;
-        return Err(ServerError::Io(e));
-    }
-    let reply = match tokio::time::timeout(
-        ctx.config.connect_timeout,
-        read_stream_reply(&mut tunnel_io),
-    )
-    .await
-    {
-        Ok(Ok(r)) => r,
-        Ok(Err(e)) => {
-            reply_socks5_failure(stream, ReplyCode::GeneralFailure).await;
-            return Err(ServerError::Io(e));
-        }
-        Err(_) => {
-            reply_socks5_failure(stream, ReplyCode::TtlExpired).await;
-            return Err(ServerError::Timeout);
-        }
-    };
-    if reply.status != 0 {
-        reply_socks5_failure(stream, ReplyCode::from_u8(reply.status)).await;
-        return Err(ServerError::Io(std::io::Error::new(
-            std::io::ErrorKind::ConnectionRefused,
-            reply.message,
-        )));
-    }
-
-    // Tunnel ready — NOW send the SOCKS5 success reply with relay_addr.
-    let bind_addr = TargetAddr::Ip(relay_addr);
-    let mut buf = Vec::new();
-    write_command_reply(ReplyCode::Succeeded, &bind_addr, &mut buf);
-    stream.write_all(&buf).await?;
-
-    tracing::debug!(%peer_addr, "UDP ASSOCIATE routed through tunnel");
-
-    let relay_result = tokio::time::timeout(
-        ctx.config.idle_timeout,
-        relay_udp_tunneled(tcp_control, relay_socket, peer_addr.ip(), tunnel_io, cancel),
-    )
-    .await;
-
-    match relay_result {
-        Ok(Ok(())) => {
-            tracing::debug!(%peer_addr, "tunnel UDP ASSOCIATE finished");
-            Ok(())
-        }
-        Ok(Err(e)) => Err(ServerError::Io(e)),
-        Err(_) => Err(ServerError::Timeout),
-    }
+    tracing::debug!(%peer_addr, "UDP ASSOCIATE finished");
+    outcome.map_err(|e| {
+        bump(&ctx.extended_metrics.errors_relay);
+        ServerError::Io(e)
+    })
 }
 
-/// Configure target socket: NODELAY + keepalive.
-///
-/// Probe count (`TCP_KEEPCNT`) is applied via libc on unix for consistency
-/// across glibc Linux / musl Linux / macOS; Windows uses OS defaults
-/// (`socket2::TcpKeepalive::with_retries` is Linux-only).
-fn configure_target_socket(stream: &TcpStream, config: &Config) -> Result<(), std::io::Error> {
-    let sock_ref = SockRef::from(stream);
-    sock_ref.set_nodelay(true)?;
-
-    let keepalive = socket2::TcpKeepalive::new()
-        .with_time(config.tcp_keepalive_idle)
-        .with_interval(config.tcp_keepalive_interval);
-
-    sock_ref.set_tcp_keepalive(&keepalive)?;
-    crate::tunnel::set_keepalive_probes(stream, config.tcp_keepalive_probes);
-    Ok(())
-}
-
-/// Resolve a TargetAddr to a SocketAddr via DNS if needed.
-async fn resolve_target(target: &TargetAddr, config: &Config) -> Result<SocketAddr, ServerError> {
+/// Resolve a TargetAddr to every address it maps to, via DNS if needed.
+async fn resolve_target(
+    target: &TargetAddr,
+    config: &Config,
+) -> Result<Vec<SocketAddr>, ServerError> {
     match target {
-        TargetAddr::Ip(addr) => Ok(*addr),
+        TargetAddr::Ip(addr) => Ok(vec![*addr]),
         TargetAddr::Domain(domain, port) => {
-            let addr_str = format!("{domain}:{port}");
-            let resolved = tokio::time::timeout(
-                config.dns_timeout,
-                tokio::net::lookup_host(&addr_str),
-            )
-            .await
-            .map_err(|_| {
-                ServerError::DnsResolution(
-                    domain.clone(),
-                    std::io::Error::new(std::io::ErrorKind::TimedOut, "DNS timeout"),
-                )
-            })?
-            .map_err(|e| ServerError::DnsResolution(domain.clone(), e))?
-            .next()
-            .ok_or_else(|| {
-                ServerError::DnsResolution(
-                    domain.clone(),
-                    std::io::Error::new(
-                        std::io::ErrorKind::NotFound,
-                        "no addresses found",
-                    ),
-                )
-            })?;
-
-            tracing::trace!(domain = %domain, resolved = %resolved, "DNS resolved");
-            Ok(resolved)
+            let addrs = net::resolve(domain, *port, config.dns_timeout)
+                .await
+                .map_err(|e| ServerError::DnsResolution(domain.clone(), e))?;
+            tracing::trace!(domain = %domain, ?addrs, "DNS resolved");
+            Ok(addrs)
         }
     }
 }

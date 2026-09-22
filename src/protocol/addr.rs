@@ -125,6 +125,15 @@ impl TargetAddr {
     }
 }
 
+impl fmt::Display for TargetAddr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            TargetAddr::Ip(addr) => write!(f, "{addr}"),
+            TargetAddr::Domain(domain, port) => write!(f, "{domain}:{port}"),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -211,15 +220,6 @@ mod tests {
                 assert_eq!(sa.to_string(), "0.0.0.0:0");
             }
             _ => panic!("expected Ip variant"),
-        }
-    }
-}
-
-impl fmt::Display for TargetAddr {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            TargetAddr::Ip(addr) => write!(f, "{addr}"),
-            TargetAddr::Domain(domain, port) => write!(f, "{domain}:{port}"),
         }
     }
 }

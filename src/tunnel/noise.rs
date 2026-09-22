@@ -12,7 +12,15 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 const NOISE_PATTERN: &str = "Noise_NNpsk0_25519_ChaChaPoly_BLAKE2s";
-const MAX_MSG_LEN: usize = 65535;
+/// Largest message exchanged through a `NoiseStream`: the two Noise handshake
+/// messages (< 100 bytes) and `Hello`/`HelloAck` (the longest, a rejection
+/// reason, is capped at 1 KiB + framing). Everything after the handshake goes
+/// through `NoiseByteStream`, which has its own full-size buffers.
+///
+/// Kept small on purpose: these buffers are allocated — and this limit is
+/// enforced — *before* the peer has proven it knows the PSK, so up to
+/// `MAX_TUNNEL_CONNECTIONS` unauthenticated peers can hold them at once.
+const MAX_MSG_LEN: usize = 2048;
 
 /// An encrypted stream wrapping TcpStream + Noise TransportState.
 pub struct NoiseStream {

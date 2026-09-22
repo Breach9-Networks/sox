@@ -8,7 +8,6 @@ pub mod tunnel_listener;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use socket2::SockRef;
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
@@ -93,19 +92,75 @@ pub async fn run_standalone(
     // Spawn traffic sampling background task
     spawn_traffic_sampler(ctx.clone(), shutdown.clone());
 
+    serve_socks(&listener, &ctx, &limiter, &shutdown).await;
+
+    let snap = ctx.metrics.snapshot();
+    tracing::info!(%snap, "server stopped");
+
+    Ok(())
+}
+
+/// How often a "connection rejected by a limit" warning may be logged. Under
+/// an attack every rejected connection would otherwise produce a log line.
+const REJECT_LOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Pause after a failed `accept()` so fd exhaustion does not become a busy loop.
+const ACCEPT_ERROR_BACKOFF: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Rate-limits a repetitive warning: `ready()` is true at most once per
+/// `REJECT_LOG_INTERVAL`, and reports how many events were suppressed since.
+struct LogThrottle {
+    last: Option<std::time::Instant>,
+    suppressed: u64,
+}
+
+impl LogThrottle {
+    fn new() -> Self {
+        Self { last: None, suppressed: 0 }
+    }
+
+    fn ready(&mut self) -> Option<u64> {
+        if self.last.is_some_and(|t| t.elapsed() < REJECT_LOG_INTERVAL) {
+            self.suppressed += 1;
+            return None;
+        }
+        self.last = Some(std::time::Instant::now());
+        Some(std::mem::take(&mut self.suppressed))
+    }
+}
+
+/// The SOCKS accept loop shared by standalone and tunnel mode: accept, apply
+/// the connection limits, spawn a handler per connection — then, once
+/// `shutdown` fires, stop accepting and drain the in-flight connections
+/// (bounded by `drain_timeout`) instead of abandoning relays mid-flight.
+async fn serve_socks(
+    listener: &TcpListener,
+    ctx: &Arc<ServerContext>,
+    limiter: &Arc<Semaphore>,
+    shutdown: &CancellationToken,
+) {
     let mut tasks = JoinSet::new();
+    let mut reject_log = LogThrottle::new();
 
     loop {
         tokio::select! {
             biased;
 
             _ = shutdown.cancelled() => {
-                let snap = ctx.metrics.snapshot();
                 tracing::info!(
-                    active = snap.active_connections,
+                    active = tasks.len(),
                     "shutdown signal received, draining connections..."
                 );
                 break;
+            }
+
+            // Reap finished handlers as we go. A JoinSet keeps every finished
+            // task's result until it is joined — never joining while serving
+            // would grow memory by one entry per connection, forever.
+            Some(joined) = tasks.join_next(), if !tasks.is_empty() => {
+                if let Err(e) = joined && e.is_panic() {
+                    tracing::error!(error = %e, "connection handler panicked");
+                }
             }
 
             result = listener.accept() => {
@@ -116,57 +171,38 @@ pub async fn run_standalone(
                         // must not kill the server. Back off briefly so we do
                         // not busy-spin, then keep accepting.
                         tracing::warn!(error = %e, "accept failed, backing off");
-                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
                         continue;
                     }
                 };
 
-                // Global connection limit
-                let permit = match limiter.clone().try_acquire_owned() {
-                    Ok(permit) => permit,
-                    Err(_) => {
-                        tracing::warn!(%peer_addr, "global connection limit reached");
-                        drop(stream);
-                        continue;
+                // Global, then per-IP connection limit.
+                let Ok(permit) = limiter.clone().try_acquire_owned() else {
+                    if let Some(suppressed) = reject_log.ready() {
+                        tracing::warn!(%peer_addr, suppressed, "global connection limit reached");
                     }
+                    continue;
                 };
-
-                // Per-IP connection limit
-                let ip_guard = match ctx.ip_limiter.try_acquire(peer_addr.ip()) {
-                    Some(guard) => guard,
-                    None => {
-                        tracing::warn!(%peer_addr, "per-IP connection limit reached");
-                        drop(stream);
-                        continue;
+                let Some(ip_guard) = ctx.ip_limiter.try_acquire(peer_addr.ip()) else {
+                    if let Some(suppressed) = reject_log.ready() {
+                        tracing::warn!(%peer_addr, suppressed, "per-IP connection limit reached");
                     }
+                    continue;
                 };
 
                 let ctx = ctx.clone();
-
                 tasks.spawn(async move {
                     let _permit = permit;
                     let _ip_guard = ip_guard;
+                    // The active count is decremented by this guard on drop.
                     let _conn = ctx.metrics.connection_opened();
-                    ctx.extended_metrics.record_connection();
-                    ctx.extended_metrics.record_ip_connect(peer_addr.ip());
+                    ctx.extended_metrics.update_peak(
+                        ctx.metrics.active_connections.load(std::sync::atomic::Ordering::Relaxed),
+                    );
 
-                    let active = ctx.metrics.active_connections.load(std::sync::atomic::Ordering::Relaxed);
-                    ctx.extended_metrics.update_peak(active);
-
-                    let (authed_user, result) = handle_client(stream, peer_addr, &ctx).await;
-
-                    if let Some(ref user) = authed_user {
-                        ctx.extended_metrics.record_user_connect(user);
-                    }
-                    if let Err(e) = result {
+                    if let Err(e) = handle_client(stream, peer_addr, &ctx).await {
                         tracing::debug!(%peer_addr, error = %e, "connection ended with error");
                     }
-                    if let Some(ref user) = authed_user {
-                        ctx.extended_metrics.record_user_disconnect(user);
-                    }
-
-                    ctx.extended_metrics.record_ip_disconnect(peer_addr.ip());
-                    // active count is decremented by the `_conn` guard on drop.
                 });
             }
         }
@@ -176,79 +212,35 @@ pub async fn run_standalone(
     let drain_deadline = tokio::time::sleep(ctx.config.drain_timeout);
     tokio::pin!(drain_deadline);
 
-    loop {
-        if tasks.is_empty() {
-            tracing::info!("all connections drained");
-            break;
-        }
-
+    while !tasks.is_empty() {
         tokio::select! {
             _ = tasks.join_next() => {}
             _ = &mut drain_deadline => {
-                let remaining = tasks.len();
-                tracing::warn!(remaining, "drain timeout, aborting remaining connections");
+                tracing::warn!(
+                    remaining = tasks.len(),
+                    "drain timeout, aborting remaining connections"
+                );
                 tasks.abort_all();
-                break;
+                return;
             }
         }
     }
-
-    let snap = ctx.metrics.snapshot();
-    tracing::info!(%snap, "server stopped");
-
-    Ok(())
+    tracing::info!("all connections drained");
 }
 
 async fn handle_client(
-    stream: tokio::net::TcpStream,
+    mut stream: tokio::net::TcpStream,
     peer_addr: SocketAddr,
     ctx: &ServerContext,
-) -> (Option<String>, Result<(), crate::error::ServerError>) {
+) -> Result<(), crate::error::ServerError> {
     tracing::debug!(%peer_addr, "new connection");
 
-    // Apply TCP_NODELAY + keepalive via socket2
-    if let Err(e) = configure_socket(&stream, &ctx.config) {
-        return (None, Err(crate::error::ServerError::Io(e)));
-    }
-
-    let mut stream = stream;
+    crate::net::configure_stream(&stream, &ctx.config.keepalive())?;
 
     // Run to completion. Graceful shutdown is handled by the accept loop
     // halting and the JoinSet drain bounding in-flight connections — not by
     // abandoning a relay mid-flight.
-    let (authed_user, result) =
-        connection::handle_connection(&mut stream, peer_addr, ctx).await;
-
-    // Return the authenticated username for the caller to track
-    if let Some(ref user) = authed_user {
-        tracing::trace!(%peer_addr, %user, "authenticated session ended");
-    }
-
-    (authed_user, result)
-}
-
-/// Configure TCP socket options: NODELAY + keepalive.
-fn configure_socket(
-    stream: &tokio::net::TcpStream,
-    config: &Config,
-) -> Result<(), std::io::Error> {
-    let sock_ref = SockRef::from(stream);
-
-    // Disable Nagle's algorithm for lower latency
-    sock_ref.set_nodelay(true)?;
-
-    // Enable TCP keepalive for dead connection detection
-    let keepalive = socket2::TcpKeepalive::new()
-        .with_time(config.tcp_keepalive_idle)
-        .with_interval(config.tcp_keepalive_interval);
-
-    // Note: with_retries() is not available on all platforms (macOS, musl)
-    #[cfg(all(target_os = "linux", not(target_env = "musl")))]
-    let keepalive = keepalive.with_retries(config.tcp_keepalive_probes);
-
-    sock_ref.set_tcp_keepalive(&keepalive)?;
-
-    Ok(())
+    connection::handle_connection(&mut stream, peer_addr, ctx).await
 }
 
 /// Run the SOCKS proxy server in tunnel mode.
@@ -302,7 +294,7 @@ pub async fn run_server(
     let tunnel_router = router.clone();
     let tunnel_max_streams = config.tunnel_max_streams;
     let tunnel_recv_window_mb = config.tunnel_recv_window_mb;
-    let tunnel_handle = tokio::spawn(async move {
+    let mut tunnel_handle = tokio::spawn(async move {
         if let Err(e) = tunnel_listener::run_tunnel_listener(
             &tunnel_listen_addr,
             &secret,
@@ -322,91 +314,22 @@ pub async fn run_server(
     tracing::info!(socks = %config.listen_addr, "SOCKS proxy listening (tunnel mode)");
 
     let limiter = Arc::new(Semaphore::new(config.max_connections));
-    let mut tasks = JoinSet::new();
 
-    loop {
-        tokio::select! {
-            biased;
-            _ = shutdown.cancelled() => break,
-            result = listener.accept() => {
-                let (stream, peer_addr) = match result {
-                    Ok(pair) => pair,
-                    Err(e) => {
-                        // A failed accept (e.g. EMFILE/ENFILE — fd exhaustion)
-                        // must not kill the server. Back off briefly so we do
-                        // not busy-spin, then keep accepting.
-                        tracing::warn!(error = %e, "accept failed, backing off");
-                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                        continue;
-                    }
-                };
-
-                let permit = match limiter.clone().try_acquire_owned() {
-                    Ok(p) => p,
-                    Err(_) => { drop(stream); continue; }
-                };
-                let ip_guard = match ctx.ip_limiter.try_acquire(peer_addr.ip()) {
-                    Some(g) => g,
-                    None => { drop(stream); continue; }
-                };
-
-                let ctx = ctx.clone();
-
-                tasks.spawn(async move {
-                    let _permit = permit;
-                    let _ip_guard = ip_guard;
-                    let _conn = ctx.metrics.connection_opened();
-                    ctx.extended_metrics.record_connection();
-                    ctx.extended_metrics.record_ip_connect(peer_addr.ip());
-
-                    let active = ctx.metrics.active_connections.load(std::sync::atomic::Ordering::Relaxed);
-                    ctx.extended_metrics.update_peak(active);
-
-                    let (authed_user, result) = handle_client(stream, peer_addr, &ctx).await;
-
-                    if let Some(ref user) = authed_user {
-                        ctx.extended_metrics.record_user_connect(user);
-                    }
-                    if let Err(e) = result {
-                        tracing::debug!(%peer_addr, error = %e, "connection ended with error");
-                    }
-                    if let Some(ref user) = authed_user {
-                        ctx.extended_metrics.record_user_disconnect(user);
-                    }
-
-                    ctx.extended_metrics.record_ip_disconnect(peer_addr.ip());
-                    // active count is decremented by the `_conn` guard on drop.
-                });
-            }
-        }
-    }
-
-    // Drain in-flight SOCKS connections (bounded by drain_timeout) before
-    // stopping the tunnel — relays keep their tunnel sessions alive while
-    // they finish.
-    let drain_deadline = tokio::time::sleep(ctx.config.drain_timeout);
-    tokio::pin!(drain_deadline);
-    loop {
-        if tasks.is_empty() {
-            tracing::info!("all connections drained");
-            break;
-        }
-        tokio::select! {
-            _ = tasks.join_next() => {}
-            _ = &mut drain_deadline => {
-                tracing::warn!(
-                    remaining = tasks.len(),
-                    "drain timeout, aborting remaining connections"
-                );
-                tasks.abort_all();
-                break;
-            }
-        }
-    }
+    // Accept, then drain in-flight SOCKS connections (bounded by
+    // drain_timeout) before stopping the tunnel — relays keep their tunnel
+    // sessions alive while they finish.
+    serve_socks(&listener, &ctx, &limiter, &shutdown).await;
 
     // SOCKS connections drained — now stop the tunnel sessions.
+    // The listener gets a moment to close its sessions cleanly (GoAway) so
+    // clients reconnect promptly instead of waiting out a dead socket.
     tunnel_cancel.cancel();
-    tunnel_handle.abort();
+    if tokio::time::timeout(crate::tunnel::CLOSE_TIMEOUT * 2, &mut tunnel_handle)
+        .await
+        .is_err()
+    {
+        tunnel_handle.abort();
+    }
 
     let snap = ctx.metrics.snapshot();
     tracing::info!(%snap, "server stopped");
@@ -417,7 +340,8 @@ pub async fn run_server(
 /// Spawn a background task that samples traffic every 5 seconds for the chart.
 fn spawn_traffic_sampler(ctx: Arc<ServerContext>, cancel: CancellationToken) {
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+        const SAMPLE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+        let mut interval = tokio::time::interval(SAMPLE_INTERVAL);
         loop {
             tokio::select! {
                 biased;
@@ -428,6 +352,8 @@ fn spawn_traffic_sampler(ctx: Arc<ServerContext>, cancel: CancellationToken) {
                         snap.bytes_client_to_target,
                         snap.bytes_target_to_client,
                     );
+                    ctx.extended_metrics
+                        .sample_connection_rate(snap.total_connections, SAMPLE_INTERVAL);
                 }
             }
         }

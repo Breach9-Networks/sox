@@ -37,6 +37,24 @@ impl PerIpLimiter {
     }
 }
 
+impl PerIpLimiter {
+    /// Top `n` source IPs by active connection count (for the dashboard) —
+    /// read straight from the limiter, the single source of per-IP truth.
+    pub fn top(&self, n: usize) -> Vec<crate::server::extended_metrics::IpCount> {
+        let counts = self.counts.lock().unwrap_or_else(|e| e.into_inner());
+        let mut top: Vec<_> = counts
+            .iter()
+            .map(|(ip, count)| crate::server::extended_metrics::IpCount {
+                ip: ip.to_string(),
+                connections: *count as u64,
+            })
+            .collect();
+        top.sort_by(|a, b| b.connections.cmp(&a.connections));
+        top.truncate(n);
+        top
+    }
+}
+
 /// Owned guard — safe to move into `tokio::spawn` tasks.
 pub struct PerIpGuard {
     counts: Arc<Mutex<HashMap<IpAddr, usize>>>,

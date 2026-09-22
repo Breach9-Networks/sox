@@ -6,12 +6,17 @@ use std::sync::atomic::Ordering;
 use serde::Serialize;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
+use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::AuthConfig;
 use crate::server::ServerContext;
 
 const DASHBOARD_HTML: &str = include_str!("dashboard.html");
+
+/// Concurrent dashboard requests. The dashboard is a diagnostic aid — it must
+/// never be able to take fds or memory from the proxy itself.
+const MAX_MONITOR_CONNECTIONS: usize = 64;
 
 /// Run the monitor HTTP server.
 pub async fn run_monitor(
@@ -26,14 +31,29 @@ pub async fn run_monitor(
     let listener = TcpListener::bind(addr).await?;
     tracing::info!(%addr, "monitor dashboard listening");
 
+    let limiter = Arc::new(Semaphore::new(MAX_MONITOR_CONNECTIONS));
+
     loop {
         tokio::select! {
             biased;
             _ = cancel.cancelled() => break,
             result = listener.accept() => {
-                let (mut stream, _) = result?;
+                let mut stream = match result {
+                    Ok((stream, _)) => stream,
+                    Err(e) => {
+                        // A failed accept (e.g. fd exhaustion) must not end
+                        // the dashboard for good.
+                        tracing::debug!(error = %e, "monitor accept failed, backing off");
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        continue;
+                    }
+                };
+                let Ok(permit) = limiter.clone().try_acquire_owned() else {
+                    continue; // over the cap — drop the connection
+                };
                 let ctx = ctx.clone();
                 tokio::spawn(async move {
+                    let _permit = permit;
                     let result = tokio::time::timeout(
                         std::time::Duration::from_secs(10),
                         handle_http(&mut stream, &ctx),
@@ -207,13 +227,7 @@ fn build_full_status(ctx: &ServerContext, window_secs: u64) -> FullStatus {
 
     let (tx_rate, rx_rate) = ext.current_rates();
 
-    let clients = if let Some(ref router) = ctx.router {
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(router.client_snapshots())
-        })
-    } else {
-        vec![]
-    };
+    let clients = build_clients(ctx);
 
     FullStatus {
         server: ServerInfo {
@@ -249,7 +263,7 @@ fn build_full_status(ctx: &ServerContext, window_secs: u64) -> FullStatus {
         rate: RateInfo {
             connections_per_sec: ext.connections_per_sec(),
         },
-        top_ips: ext.top_ips(5),
+        top_ips: ctx.ip_limiter.top(5),
         clients,
         traffic_history: ext.get_traffic_history(window_secs),
     }
@@ -266,11 +280,8 @@ fn build_metrics(ctx: &ServerContext) -> MetricsCompact {
 }
 
 fn build_clients(ctx: &ServerContext) -> Vec<crate::tunnel::router::ClientSnapshot> {
-    if let Some(ref router) = ctx.router {
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(router.client_snapshots())
-        })
-    } else {
-        vec![]
-    }
+    ctx.router
+        .as_ref()
+        .map(|router| router.client_snapshots())
+        .unwrap_or_default()
 }

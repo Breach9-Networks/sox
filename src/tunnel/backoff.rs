@@ -9,6 +9,10 @@ use std::time::Duration;
 const MULTIPLIER: f64 = 1.5;
 /// jitter 幅度：±20%，打散大量 client 的同步重連洪峰。
 const JITTER: f64 = 0.2;
+/// `base` 下限:0 會讓斷線的 client 以零延遲空轉重連(吃滿 CPU 並轟炸 server)。
+const MIN_BASE: Duration = Duration::from_millis(100);
+/// `max` 上限:再大沒有實際意義,且過大的值會讓 `Duration::from_secs_f64` panic。
+const MAX_CAP: Duration = Duration::from_secs(3600);
 
 /// 單條 session 的重連退避狀態。
 pub struct Backoff {
@@ -19,7 +23,12 @@ pub struct Backoff {
 
 impl Backoff {
     /// `base` = 第一次重連的等待基數；`max` = 退避封頂。
+    ///
+    /// 兩者都會被夾進合理範圍(`base` ∈ [100ms, 1h],`max` ∈ [`base`, 1h]),
+    /// 所以設定檔 / CLI 給出 0 或荒謬大值都不會造成空轉或 panic。
     pub fn new(base: Duration, max: Duration) -> Self {
+        let base = base.clamp(MIN_BASE, MAX_CAP);
+        let max = max.clamp(base, MAX_CAP);
         Self { base, max, attempt: 0 }
     }
 
@@ -34,7 +43,8 @@ impl Backoff {
     /// jitter。jitter 用 `rand` 把大量 client 的重連時間點打散，
     /// 避免 server 恢復瞬間被同步洪峰再次打垮。
     pub fn next_delay(&mut self) -> Duration {
-        let raw = self.base.as_secs_f64() * MULTIPLIER.powi(self.attempt as i32);
+        // attempt 封頂:1.5^64 早已遠超 MAX_CAP,再大只會讓 powi 溢成 inf。
+        let raw = self.base.as_secs_f64() * MULTIPLIER.powi(self.attempt.min(64) as i32);
         let capped = raw.min(self.max.as_secs_f64());
         self.attempt = self.attempt.saturating_add(1);
 
@@ -89,5 +99,19 @@ mod tests {
         b.reset();
         let d = b.next_delay();
         assert!(d <= Duration::from_secs(10), "after reset delay {d:?} should return to base");
+    }
+
+    #[test]
+    fn degenerate_inputs_neither_spin_nor_panic() {
+        // A14: reconnect_interval = 0 must not become a zero-delay loop.
+        let mut b = Backoff::new(Duration::ZERO, Duration::ZERO);
+        for _ in 0..100 {
+            assert!(b.next_delay() >= Duration::from_millis(50));
+        }
+        // Absurd cap + many attempts must not overflow `Duration::from_secs_f64`.
+        let mut b = Backoff::new(Duration::from_secs(u64::MAX / 4), Duration::MAX);
+        for _ in 0..10_000 {
+            assert!(b.next_delay() <= Duration::from_secs(3600 * 2));
+        }
     }
 }
