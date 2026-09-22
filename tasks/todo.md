@@ -1,3 +1,107 @@
+# sox — Round 3 優化(2026-09-22 全碼審查 → 全數修復)
+
+來源:完整讀碼審查(熱路徑人工 + 3 個 subagent)。「已核對」= 主 agent 對過程式碼;
+其餘為 subagent 回報,動工前先複核。依 CLAUDE.md 優先序排列。
+
+## R3-A: 穩定性(必修)
+
+- [x] **A1** `JoinSet` 服務期間不回收 → 長跑記憶體無限成長(已核對)
+  - `server/mod.rs:96/146`、`:325/355`、`server/tunnel_listener.rs:49/76`;`join_next` 只在 drain 迴圈
+  - 修:accept `select!` 加 `Some(_) = tasks.join_next(), if !tasks.is_empty()`
+- [x] **A2** tunnel listener accept 迴圈 `result?` / `set_nodelay(true)?` 一錯即整個結束(已核對)
+  - `server/tunnel_listener.rs:59-60`;`server/monitor.rs:34` 同樣寫法(未核對)
+  - 修:比照 `mod.rs:111-119` warn + backoff + continue;nodelay 失敗不致命
+- [x] **A3** `panic = "abort"` 讓 `session.rs:177` 的 `catch_unwind` 重啟在 release 無效(已核對)
+  - 二選一:改 `unwind`,或移除該監控並在文件註明靠外部 supervisor
+- [x] **A4** UDP relay 的 `timeout(idle_timeout, relay_udp…)` 是 wall-clock 上限,違反 idle 語意
+  - `server/connection.rs:600-604`、`:687-691`;觸發後 `relay/udp.rs:102,116,127,202` 的 detached task 不會被取消(socket/fd 洩漏)
+  - 修:真正的 idle timer + `cancel.drop_guard()` + JoinSet
+- [x] **A5** client 端 shutdown 不 drain 進行中 relay
+  - `client/mod.rs:57-60`、`tunnel/session.rs:318-331`(detached `tokio::spawn` `:323`);`poll_close` 無 timeout(`:331`、`:613`)
+  - 修:JoinSet + 持續 poll `conn` 直到清空或 `drain_timeout`
+- [x] **A6** `router.open_stream()` 與 preamble 寫入無 timeout
+  - `server/connection.rs:433,467,636,651`、`tunnel/router.rs:180,183`
+  - 順帶:`router.rs:166` 無跨 client failover;StreamReply 前 stream 死掉不重試
+- [x] **A7** 半開偵測只靠 keepalive;有未 ACK 資料時 keepalive 不探測
+  - 加 app-level heartbeat 或 `TCP_USER_TIMEOUT`(cfg-gated);同 `(client_id, session_index)` 重新註冊時踢掉舊 session(`tunnel_listener.rs:151`)
+- [x] **A8** UDP 大小不對稱:送端讀 65535 不檢查,收端 >9216 回 Err 拆掉整條 association
+  - `session.rs:490-503`、`relay/udp.rs:386-405` vs `udp.rs:312`;`protocol.rs:204` `as u16` 可能截斷
+  - 修:送端丟棄超大 datagram
+- [x] **A9** UDP 單一錯誤殺整條 association:`session.rs:473` `send_to(..)?`;`relay/udp.rs:136-139,256` `recv_from` 錯誤即 break(Windows WSAECONNRESET)
+- [x] **A10** `relay/udp.rs:91,185-212` `target_sockets` 無上限(每目標一個 socket + task + 64 KiB)→ 單一 client 可耗盡 fd
+  - 修:每 association 一個 outbound socket(v4 + v6)+ 來源過濾
+- [x] **A11** UDP DNS:無 `dns_timeout`、每封包查詢、在 receive loop 內 await(`relay/udp.rs:171,287`、`session.rs:467`)
+- [x] **A12** SOCKS handshake:SOCKS4 單次 `read()`(`connection.rs:230-238`);SOCKS5 513/262 byte chunk 超讀且丟棄 leftover(`:133-145,174-186`);timeout 每階段一份 ≈ 4×(`:36,81,127,170`)
+  - 修:單一 `timeout_at` deadline + 精確 `read_exact`
+- [x] **A13** tunnel client 撥目標:無 keepalive(`session.rs:363`);多位址依序嘗試共用 10s,黑洞 AAAA 會吃光預算(`:361`)(已核對)
+- [x] **A14** `backoff.rs:37-43`:`reconnect_interval=0` → 零延遲重連空轉;荒謬 `reconnect_max` 使 `from_secs_f64` panic(`main.rs:292,318` 未驗證)
+
+## R3-B: 跨平台 / IPv6
+
+- [x] **B1** UDP 全部只綁 `0.0.0.0`:`connection.rs:570`、`relay/udp.rs:185`、`session.rs:419`(已核對 session.rs)
+- [x] **B2** dual-stack listener 下 `peer_ip` 為 `::ffff:a.b.c.d`,`relay/udp.rs:144` 比對永遠不等 → 全丟;`src` 內無 `to_canonical`(已核對)
+- [x] **B3** `server/mod.rs:231-252` client 端 socket 未用 `set_keepalive_probes` helper(macOS/musl 無 KEEPCNT);與 `connection.rs:708` 重複
+- [x] **B4** `signal.rs:25-29` Windows 只處理 Ctrl+C;unix 第二次訊號無法強制退出
+
+## R3-C: 效能(皆需 release build 量測 before/after)
+
+- [x] **C1** Noise × yamux framing:yamux header/body 分兩次 `poll_write`(yamux `frame/io.rs:98,131`)→ 每 16 KiB frame 2 次 AEAD + 2 次 write + 收端 4 次 read(已核對)
+  - 修:`noise_stream.rs` `poll_write` 累積 plaintext,`poll_flush`/滿了才加密送出;`split_send_size` 調到 ~64 KiB
+- [x] **C2** `noise_stream.rs:99` 每 frame `vec![0u8; len]` → 重用 buffer(已核對)
+- [x] **C3** Noise 讀取端改 buffered(一次讀大塊再切 frame)(已核對)
+- [x] **C4** `opt-level="z"` vs 吞吐:A/B `3` / `"s"`,或保留 `z` 並對 `chacha20`/`poly1305`/`snow`/`yamux`/`tokio` 做 per-package override
+- [x] **C5** UDP 每 datagram 2–3 次配置與拷貝(`relay/udp.rs:403-405,318,427`、`protocol.rs:199,224`、`session.rs:501`)
+- [x] **C6** `relay/tcp.rs:82,100` `Mutex<Instant>` → atomic coarse timestamp(已核對)
+- [x] **C7** `router.rs:91,94,163-176` tokio Mutex(無 await)+ 每次 open clone 整個 Vec → std Mutex/RwLock
+- [x] **C8** 每連線 3 次全域 mutex(`IpTracker` 與 `PerIpLimiter` 重複、`RateTracker`);`noise.rs` handshake 3×64 KiB buffer
+
+## R3-D: 正確性 / 維護性
+
+- [x] **D1** `main.rs:203-212` clap 預設值永遠蓋掉 TOML(`listen`、`max_connections`、`max_connections_per_ip`、`idle_timeout` 檔案設定無效);client 模式相反(`:299-323`)(已核對)→ CLI 改 `Option<T>`
+- [x] **D2** metrics:active user 恆 ≈0(`mod.rs:158-166`)、`errors_*` 從未遞增、tunnel 模式流量圖非即時(`connection.rs:520-521`)、`record_relay` 死碼
+- [x] **D3** 重複:`mod.rs:98-194` vs `:327-405` accept/drain;`relay_tcp_live` vs `relay_bidirectional`;wire reader 繞過 #9 長度上限的 codec(`session.rs:518-519`、`connection.rs:538-539`)
+- [x] **D4** `monitor.rs:211,270` async handler 內 `block_in_place` + `block_on`;monitor 無並發上限
+- [x] **D5** 測試缺口:session 中途死亡、多 client failover、半開、client drain、錯 PSK / handshake timeout 皆無 e2e
+
+## R3 驗證
+
+- [x] `cargo test`:**86 unit + 17 e2e = 103 全綠**(連跑 3 次無 flaky);另有 3 個 `#[ignore]`(1 個 55s soak、2 個 bench)
+- [x] `cargo clippy --all-targets`:0 warning(連同 `addr.rs` 既有的 `items_after_test_module` 一併清掉)
+- [x] `cargo check --target x86_64-pc-windows-gnu` / `x86_64-unknown-linux-musl`:通過
+- [x] soak:`idle_tunnel_session_survives_the_read_watchdog` 閒置 55s 不重連;把 heartbeat 關掉後同一測試在 45s 失敗(證明測試有鑑別力、heartbeat 確實必要)
+
+## R3 效能量測(release、loopback、單 stream 上傳、同機 server+client)
+
+| 組態 | tunnel | standalone | binary |
+|---|---|---|---|
+| 修改前(`opt-level="z"`) | 92 MiB/s (0.78 Gbps) | 415 MiB/s | 1.69 MB |
+| 新程式碼,`"z"` | 100 MiB/s | 441 MiB/s | 1.69 MB |
+| 新程式碼,全域 `opt-level=3` | 170 MiB/s | 435 MiB/s | 2.59 MB |
+| **新程式碼,`"z"` + 資料路徑 crate 設 3(採用)** | **160 MiB/s (1.34 Gbps)** | 441 MiB/s | 1.72 MB |
+| 舊程式碼 + 同一 profile(拆解貢獻用) | 139 MiB/s | — | — |
+
+tunnel 吞吐 +74%:profile 約 +50%,Noise coalescing / buffered read 約 +15%。binary 只多 32 KB。
+loopback 無 RTT,此數字只驗證 CPU/AEAD/syscall 面;RTT 面的 yamux window 行為未變(見 lessons.md)。
+
+## R3 與原 backlog 的出入
+
+- **C1 `split_send_size`**:A/B 16 KiB vs 64 KiB 無可量測差異(160 vs 160 MiB/s),大 frame 反而增加 stream 間 head-of-line blocking → **不改**,維持 yamux 預設。coalescing 本身保留。
+- **A3**:採 `panic = "unwind"`(穩定性優先)。
+- **A7**:yamux 0.13 的 ping 沒有自己的 timer,閒置連線不會送 → 新增 driver heartbeat(10s)+ `NoiseByteStream` 讀取看門狗(45s)+ 同 slot 重連踢掉舊 session。未採 `TCP_USER_TIMEOUT`(Linux only,看門狗已跨平台涵蓋)。
+- **A8**:上限維持 9216,改由送端丟棄超限 datagram(收端不再因此拆 association)。>9 KB 的 UDP 經 tunnel 仍不支援,屬既有設計取捨。
+- **A10/B1**:UDP 出口改為每 association 一個 v4 + 一個 v6 socket(`UdpOutbound`,standalone 與 tunnel client 共用);回包一律依「曾送達的目標」過濾(standalone 以前不過濾)。
+- **A12**:SOCKS5 改精確 `read_exact`;SOCKS4 的 NUL 結尾欄位用 `peek` + 精確讀取,不超讀。
+- **D1**:CLI 改 `Option<T>`,優先序 CLI > TOML > 預設,三種模式一致;client 模式現在也吃 top-level `connect_timeout` / `idle_timeout` / `dns_timeout` / `drain_timeout`(解掉 Round 1 的「待觀察」)。TOML `listen` 無法解析改為報錯。
+- **D5**:新增 7 個 e2e + 多個 unit。**半開連線**無法在 loopback 自動化(需丟封包),以看門狗 unit test + soak 間接涵蓋。accept 失敗(EMFILE)路徑、`JoinSet` 回收無自動化測試,靠 code review。
+
+## R3 剩餘風險 / 後續
+
+- `relay_bidirectional` 一個方向出錯後,另一方向最久等到 `idle_timeout` 才結束(有界,未改)。
+- Windows 上 `TcpStream::peek`、signal handler 僅 cross-check 編譯,未實機執行。
+- 全部變更仍在 working tree,未 commit。
+
+---
+
 # sox — code review Round 2 修復(15 項)
 
 來源:`/code-review max` 第二輪查證,15 項已驗證 bug(嚴重度遞減)。
