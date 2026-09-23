@@ -29,27 +29,31 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    // Options that also exist in the TOML file are `Option`s with no clap
+    // default: precedence is CLI flag > config file > built-in default, and a
+    // clap default would be indistinguishable from an explicit flag — it would
+    // silently override the file.
     /// Run as a standalone SOCKS proxy (direct connections)
     Standalone {
-        /// Listen address
-        #[arg(short, long, default_value = "127.0.0.1:1080")]
-        listen: SocketAddr,
+        /// Listen address [default: 127.0.0.1:1080]
+        #[arg(short, long)]
+        listen: Option<SocketAddr>,
 
         /// Configuration file (TOML)
         #[arg(short, long)]
         config: Option<PathBuf>,
 
-        /// Maximum concurrent connections
-        #[arg(long, default_value_t = 10_000)]
-        max_connections: usize,
+        /// Maximum concurrent connections [default: 10000]
+        #[arg(long)]
+        max_connections: Option<usize>,
 
-        /// Maximum connections per source IP
-        #[arg(long, default_value_t = 100)]
-        max_per_ip: usize,
+        /// Maximum connections per source IP [default: 100]
+        #[arg(long)]
+        max_per_ip: Option<usize>,
 
-        /// Relay idle timeout in seconds
-        #[arg(long, default_value_t = 300)]
-        idle_timeout: u64,
+        /// Relay idle timeout in seconds [default: 300]
+        #[arg(long)]
+        idle_timeout: Option<u64>,
 
         /// Add user credentials (format: user:pass, repeatable)
         #[arg(short, long = "user")]
@@ -66,13 +70,13 @@ enum Commands {
 
     /// Run as a tunnel server (public network, accepts tunnel clients)
     Server {
-        /// SOCKS service listen address
-        #[arg(short = 's', long, default_value = "0.0.0.0:1080")]
-        socks_listen: SocketAddr,
+        /// SOCKS service listen address [default: 0.0.0.0:1080]
+        #[arg(short = 's', long)]
+        socks_listen: Option<SocketAddr>,
 
-        /// Tunnel listen address (for client connections)
-        #[arg(short = 't', long, default_value = "0.0.0.0:9090")]
-        tunnel_listen: String,
+        /// Tunnel listen address, for client connections [default: 0.0.0.0:9090]
+        #[arg(short = 't', long)]
+        tunnel_listen: Option<String>,
 
         /// Configuration file (TOML)
         #[arg(short = 'c', long)]
@@ -86,9 +90,9 @@ enum Commands {
         #[arg(short, long = "user")]
         users: Vec<String>,
 
-        /// Maximum concurrent connections
-        #[arg(long, default_value_t = 10_000)]
-        max_connections: usize,
+        /// Maximum concurrent connections [default: 10000]
+        #[arg(long)]
+        max_connections: Option<usize>,
 
         /// Enable monitor dashboard on this address
         #[arg(short, long)]
@@ -101,9 +105,9 @@ enum Commands {
 
     /// Run as a tunnel client (internal network, connects to server)
     Client {
-        /// Tunnel server address (host:port)
+        /// Tunnel server address, host:port (or set [tunnel] server_addr in config)
         #[arg(short = 's', long)]
-        server_addr: String,
+        server_addr: Option<String>,
 
         /// Configuration file (TOML)
         #[arg(short = 'c', long)]
@@ -113,23 +117,29 @@ enum Commands {
         #[arg(long)]
         secret: Option<String>,
 
-        /// Unique client identifier
-        #[arg(long, default_value = "default")]
-        client_id: String,
+        /// Unique client identifier [default: default]
+        #[arg(long)]
+        client_id: Option<String>,
 
-        /// Number of concurrent yamux sessions
-        #[arg(long, default_value_t = 8)]
-        tunnel_sessions: u16,
+        /// Number of concurrent yamux sessions [default: 8]
+        #[arg(long)]
+        tunnel_sessions: Option<u16>,
 
-        /// Reconnect interval in seconds
-        #[arg(long, default_value_t = 5)]
-        reconnect_interval: u64,
+        /// Reconnect interval in seconds [default: 5]
+        #[arg(long)]
+        reconnect_interval: Option<u64>,
 
         /// Log level
         #[arg(short, long, default_value = "info")]
         verbosity: String,
     },
 }
+
+/// Built-in defaults of the CLI front end. They differ from `Config::default()`
+/// (a library-level default) on purpose: a proxy started from the command line
+/// gets conservative limits unless told otherwise.
+const DEFAULT_MAX_CONNECTIONS: usize = 10_000;
+const DEFAULT_MAX_PER_IP: usize = 100;
 
 fn parse_user_credentials(users: &[String]) -> Result<AuthConfig, String> {
     if users.is_empty() {
@@ -175,6 +185,15 @@ fn resolve_secret(cli: Option<String>, fc: Option<&FileConfig>) -> Result<String
     Err("secret required: pass --secret or set [tunnel] secret in the config file".into())
 }
 
+/// Seconds → `Duration` for a relay idle timeout; 0 is rejected — it would
+/// close every relay before any data flows.
+fn idle_timeout_from_secs(secs: u64) -> Result<std::time::Duration, String> {
+    if secs == 0 {
+        return Err("--idle-timeout=0 is invalid (would close every relay instantly)".into());
+    }
+    Ok(std::time::Duration::from_secs(secs))
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
@@ -192,25 +211,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         } => {
             init_tracing(&verbosity);
 
-            let mut config = Config::default();
+            // Layer 0: built-in defaults.
+            let mut config = Config {
+                max_connections: DEFAULT_MAX_CONNECTIONS,
+                max_connections_per_ip: DEFAULT_MAX_PER_IP,
+                ..Config::default()
+            };
 
-            // Layer 1: TOML file
+            // Layer 1: TOML file.
             if let Some(file_config) = load_file_config(&config_path)? {
-                file_config.apply_to(&mut config);
+                file_config.apply_to(&mut config)?;
             }
 
-            // Layer 2: CLI args (override file)
-            config.listen_addr = listen;
-            config.max_connections = max_connections;
-            config.max_connections_per_ip = max_per_ip;
-            if idle_timeout == 0 {
-                eprintln!(
-                    "error: --idle-timeout=0 is invalid (would close every relay instantly)"
-                );
-                std::process::exit(1);
+            // Layer 2: CLI args — only the ones actually given.
+            if let Some(v) = listen {
+                config.listen_addr = v;
             }
-            config.idle_timeout = std::time::Duration::from_secs(idle_timeout);
-
+            if let Some(v) = max_connections {
+                config.max_connections = v;
+            }
+            if let Some(v) = max_per_ip {
+                config.max_connections_per_ip = v;
+            }
+            if let Some(v) = idle_timeout {
+                config.idle_timeout = idle_timeout_from_secs(v)?;
+            }
             let auth = parse_user_credentials(&users)?;
             if !matches!(auth, AuthConfig::None) {
                 config.auth = auth;
@@ -234,15 +259,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         } => {
             init_tracing(&verbosity);
 
-            let mut config = Config::default();
+            let mut config = Config {
+                listen_addr: "0.0.0.0:1080".parse().unwrap(),
+                max_connections: DEFAULT_MAX_CONNECTIONS,
+                ..Config::default()
+            };
             let file_config = load_file_config(&config_path)?;
             if let Some(ref fc) = file_config {
-                fc.apply_to(&mut config);
+                fc.apply_to(&mut config)?;
             }
             let secret = resolve_secret(secret, file_config.as_ref())?;
+            let file_tunnel = file_config.as_ref().and_then(|fc| fc.tunnel.as_ref());
 
-            config.listen_addr = socks_listen;
-            config.max_connections = max_connections;
+            if let Some(v) = socks_listen {
+                config.listen_addr = v;
+            }
+            if let Some(v) = max_connections {
+                config.max_connections = v;
+            }
+            let tunnel_listen = tunnel_listen
+                .or_else(|| file_tunnel.and_then(|t| t.listen.clone()))
+                .unwrap_or_else(|| "0.0.0.0:9090".into());
             config.monitor_addr = monitor;
 
             let auth = parse_user_credentials(&users)?;
@@ -266,61 +303,59 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         } => {
             init_tracing(&verbosity);
 
-            // Validate server_addr has a port
-            if !server_addr.contains(':') || server_addr.ends_with(':') {
-                eprintln!("error: --server-addr must include a port, e.g. 192.168.1.1:9090");
-                std::process::exit(1);
-            }
-
             let file_config = load_file_config(&config_path)?;
             let secret = resolve_secret(secret, file_config.as_ref())?;
+            let file_tunnel = file_config.as_ref().and_then(|fc| fc.tunnel.as_ref());
 
-            let mut cfg = ClientConfig {
+            // The general timeouts ([top-level] connect/idle/dns/drain) apply
+            // to the client's side of each proxied flow as well.
+            let mut base = Config::default();
+            if let Some(ref fc) = file_config {
+                fc.apply_to(&mut base)?;
+            }
+
+            let server_addr = server_addr
+                .or_else(|| file_tunnel.and_then(|t| t.server_addr.clone()))
+                .ok_or("server address required: pass --server-addr or set [tunnel] server_addr")?;
+            if !server_addr.contains(':') || server_addr.ends_with(':') {
+                return Err("server address must include a port, e.g. 192.168.1.1:9090".into());
+            }
+            let tunnel_sessions = tunnel_sessions
+                .or_else(|| file_tunnel.and_then(|t| t.tunnel_sessions))
+                .unwrap_or(8);
+            if tunnel_sessions == 0 {
+                return Err("tunnel_sessions must be at least 1".into());
+            }
+
+            // Same precedence as the other modes: CLI > file > default.
+            let secs = std::time::Duration::from_secs;
+            let cfg = ClientConfig {
                 server_addr,
                 secret,
-                client_id,
+                client_id: client_id
+                    .or_else(|| file_tunnel.and_then(|t| t.client_id.clone()))
+                    .unwrap_or_else(|| "default".into()),
                 tunnel_sessions,
-                max_streams: 256,
-                // 必須遠大於 `max_streams × 256 KiB`（= 64 MiB at 256 streams），
-                // 否則 yamux 的 per-stream BDP auto-tuning 拿不到 headroom，
-                // 單一 stream 永遠卡在 256 KiB initial credit → 在 RTT~10ms 的
-                // 跨網路情境會被夾到約 200 Mbps。256 MiB 留 192 MiB 餘裕，
-                // 足以讓單流長到 BDP×2（1 Gbps × 60ms ≈ 15 MiB×2）。
-                // A/B-verified 2026-05-23: at 10ms RTT this lifts single-stream
-                // throughput from ~170 Mbps to ~1.38 Gbps (8× improvement).
-                recv_window_mb: 256,
-                reconnect_interval: std::time::Duration::from_secs(reconnect_interval),
-                reconnect_max: std::time::Duration::from_secs(60),
-                connect_timeout: std::time::Duration::from_secs(10),
-                idle_timeout: std::time::Duration::from_secs(300),
+                max_streams: file_tunnel
+                    .and_then(|t| t.max_streams_per_session)
+                    .unwrap_or(base.tunnel_max_streams),
+                // Must stay well above `max_streams × 256 KiB` — see
+                // `Config::tunnel_recv_window_mb` and tasks/lessons.md.
+                recv_window_mb: file_tunnel
+                    .and_then(|t| t.recv_window_mb)
+                    .unwrap_or(base.tunnel_recv_window_mb),
+                // Degenerate values (0, absurdly large) are clamped by `Backoff`.
+                reconnect_interval: secs(
+                    reconnect_interval
+                        .or_else(|| file_tunnel.and_then(|t| t.reconnect_interval))
+                        .unwrap_or(5),
+                ),
+                reconnect_max: secs(file_tunnel.and_then(|t| t.reconnect_max).unwrap_or(60)),
+                connect_timeout: base.connect_timeout,
+                idle_timeout: base.idle_timeout,
+                dns_timeout: base.dns_timeout,
+                drain_timeout: base.drain_timeout,
             };
-
-            // Override from TOML if present.
-            if let Some(ref fc) = file_config
-                && let Some(ref tunnel) = fc.tunnel
-            {
-                if let Some(ref addr) = tunnel.server_addr {
-                    cfg.server_addr = addr.clone();
-                }
-                if let Some(ref id) = tunnel.client_id {
-                    cfg.client_id = id.clone();
-                }
-                if let Some(v) = tunnel.tunnel_sessions {
-                    cfg.tunnel_sessions = v;
-                }
-                if let Some(v) = tunnel.max_streams_per_session {
-                    cfg.max_streams = v;
-                }
-                if let Some(v) = tunnel.recv_window_mb {
-                    cfg.recv_window_mb = v;
-                }
-                if let Some(v) = tunnel.reconnect_interval {
-                    cfg.reconnect_interval = std::time::Duration::from_secs(v);
-                }
-                if let Some(v) = tunnel.reconnect_max {
-                    cfg.reconnect_max = std::time::Duration::from_secs(v);
-                }
-            }
 
             let shutdown = CancellationToken::new();
             tokio::spawn(signal::shutdown_signal(shutdown.clone()));

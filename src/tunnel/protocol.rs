@@ -5,6 +5,11 @@
 //! - Stream preamble 層：`StreamOpen`/`StreamReply`，每條 yamux stream 開頭的位元組。
 //! - Payload 層：TCP stream 承載裸位元組；UDP stream 承載 `UdpDatagram`。
 
+use std::io;
+use std::ops::Range;
+
+use tokio::io::{AsyncRead, AsyncReadExt};
+
 use crate::error::ServerError;
 use crate::protocol::addr::TargetAddr;
 
@@ -147,6 +152,31 @@ impl StreamOpen {
     }
 }
 
+impl StreamOpen {
+    /// 從 stream 開頭精確讀出 preamble(自帶長度,不超讀),長度上限與
+    /// [`StreamOpen::decode`] 相同。
+    pub async fn read_from<S>(s: &mut S) -> io::Result<Self>
+    where
+        S: AsyncRead + Unpin,
+    {
+        match s.read_u8().await? {
+            0x01 => {
+                let n = s.read_u16().await? as usize;
+                if n > MAX_STREAM_TARGET_LEN {
+                    return Err(invalid_data("StreamOpen::Tcp: target length exceeds limit"));
+                }
+                let mut target = vec![0u8; n];
+                s.read_exact(&mut target).await?;
+                Ok(StreamOpen::Tcp {
+                    target: String::from_utf8_lossy(&target).into_owned(),
+                })
+            }
+            0x02 => Ok(StreamOpen::Udp),
+            other => Err(invalid_data(&format!("StreamOpen: unknown kind {other:#x}"))),
+        }
+    }
+}
+
 /// Stream preamble 回應 — client 回寫的開頭位元組。
 #[derive(Debug, Clone)]
 pub struct StreamReply {
@@ -187,6 +217,67 @@ impl StreamReply {
     }
 }
 
+impl StreamReply {
+    /// 從 stream 精確讀出一則 reply(不超讀),長度上限與
+    /// [`StreamReply::decode`] 相同。
+    pub async fn read_from<S>(s: &mut S) -> io::Result<Self>
+    where
+        S: AsyncRead + Unpin,
+    {
+        let status = s.read_u8().await?;
+        let n = s.read_u16().await? as usize;
+        if n > MAX_STREAM_MESSAGE_LEN {
+            return Err(invalid_data("StreamReply: message length exceeds limit"));
+        }
+        let mut msg = vec![0u8; n];
+        s.read_exact(&mut msg).await?;
+        Ok(StreamReply {
+            status,
+            message: String::from_utf8_lossy(&msg).into_owned(),
+        })
+    }
+}
+
+/// 把一則 UDP datagram 編成 `[len:u16][atyp][addr][port:u16][payload]` 寫進
+/// `out`(先清空,方便呼叫端重用同一個 buffer,熱路徑零配置)。
+///
+/// body 超過 [`MAX_UDP_DATAGRAM_BODY`] 時回 `false` 且 `out` 為空 —— 收端會把
+/// 超限 frame 當成 stream 錯誤、拆掉整條 association,所以**送端必須丟棄**
+/// 這種 datagram,而不是送出去。
+pub fn encode_udp_frame(addr: &TargetAddr, payload: &[u8], out: &mut Vec<u8>) -> bool {
+    out.clear();
+    out.extend_from_slice(&[0, 0]);
+    addr.write_socks5(out);
+    out.extend_from_slice(payload);
+    let body_len = out.len() - 2;
+    if body_len > MAX_UDP_DATAGRAM_BODY {
+        out.clear();
+        return false;
+    }
+    out[..2].copy_from_slice(&(body_len as u16).to_be_bytes());
+    true
+}
+
+/// 從 stream 精確讀出一則 UDP frame 到 `frame`(重用呼叫端的 buffer)。
+/// 回傳目標位址與 payload 在 `frame` 內的區間。
+pub async fn read_udp_frame<S>(
+    s: &mut S,
+    frame: &mut Vec<u8>,
+) -> io::Result<(TargetAddr, Range<usize>)>
+where
+    S: AsyncRead + Unpin,
+{
+    let body_len = s.read_u16().await? as usize;
+    if body_len > MAX_UDP_DATAGRAM_BODY {
+        return Err(invalid_data("UdpDatagram: body length exceeds limit"));
+    }
+    frame.resize(body_len, 0);
+    s.read_exact(frame).await?;
+    let (addr, addr_len) =
+        TargetAddr::parse_socks5(frame).map_err(|e| invalid_data(&e.to_string()))?;
+    Ok((addr, addr_len..body_len))
+}
+
 /// UDP stream 上的單則 datagram：`[len:u16][atyp][addr][port:u16][payload]`。
 /// `len` 涵蓋其後全部位元組。addr 沿用 SOCKS5 的 atyp+addr+port 編碼。
 #[derive(Debug, Clone)]
@@ -196,15 +287,10 @@ pub struct UdpDatagram {
 }
 
 impl UdpDatagram {
-    pub fn encode(&self) -> Vec<u8> {
-        let mut addr_bytes = Vec::new();
-        self.addr.write_socks5(&mut addr_bytes);
-        let body_len = addr_bytes.len() + self.payload.len();
-        let mut buf = Vec::with_capacity(2 + body_len);
-        buf.extend_from_slice(&(body_len as u16).to_be_bytes());
-        buf.extend_from_slice(&addr_bytes);
-        buf.extend_from_slice(&self.payload);
-        buf
+    /// `None` = body 超過 [`MAX_UDP_DATAGRAM_BODY`](見 [`encode_udp_frame`])。
+    pub fn encode(&self) -> Option<Vec<u8>> {
+        let mut buf = Vec::new();
+        encode_udp_frame(&self.addr, &self.payload, &mut buf).then_some(buf)
     }
 
     /// Ok(None) = 資料不足；Ok(Some((dat, consumed))) = 解出一則；Err = 格式錯誤。
@@ -226,8 +312,12 @@ impl UdpDatagram {
     }
 }
 
+fn invalid_data(msg: &str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, msg)
+}
+
 fn decode_err(msg: &str) -> ServerError {
-    ServerError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, msg))
+    ServerError::Io(invalid_data(msg))
 }
 
 #[cfg(test)]
@@ -337,7 +427,7 @@ mod tests {
             53,
         )));
         let dat = UdpDatagram { addr: addr.clone(), payload: vec![0xAB; 100] };
-        let bytes = dat.encode();
+        let bytes = dat.encode().unwrap();
         let (decoded, consumed) = UdpDatagram::decode(&bytes).unwrap().unwrap();
         assert_eq!(consumed, bytes.len());
         assert_eq!(decoded.addr, addr);
@@ -347,5 +437,49 @@ mod tests {
     #[test]
     fn udp_datagram_partial_returns_none() {
         assert!(matches!(UdpDatagram::decode(&[0x00]), Ok(None)));
+    }
+
+    #[test]
+    fn udp_frame_encode_rejects_oversize_and_leaves_buffer_empty() {
+        let addr = TargetAddr::Ip("1.2.3.4:53".parse().unwrap());
+        let mut out = vec![9u8; 4];
+        assert!(!encode_udp_frame(&addr, &vec![0u8; MAX_UDP_DATAGRAM_BODY], &mut out));
+        assert!(out.is_empty());
+        // 剛好在上限內(addr header 7 bytes)→ 可編碼。
+        assert!(encode_udp_frame(&addr, &vec![0u8; MAX_UDP_DATAGRAM_BODY - 7], &mut out));
+    }
+
+    #[tokio::test]
+    async fn udp_frame_stream_roundtrip_reuses_buffer() {
+        let addr = TargetAddr::Domain("example.com".into(), 443);
+        let mut wire = Vec::new();
+        let mut one = Vec::new();
+        for payload in [&b"first"[..], &b"second-longer"[..]] {
+            assert!(encode_udp_frame(&addr, payload, &mut one));
+            wire.extend_from_slice(&one);
+        }
+        let mut rd = &wire[..];
+        let mut frame = Vec::new();
+        let (a, r) = read_udp_frame(&mut rd, &mut frame).await.unwrap();
+        assert_eq!((a, &frame[r]), (addr.clone(), &b"first"[..]));
+        let (a, r) = read_udp_frame(&mut rd, &mut frame).await.unwrap();
+        assert_eq!((a, &frame[r]), (addr, &b"second-longer"[..]));
+    }
+
+    #[tokio::test]
+    async fn stream_readers_enforce_length_caps() {
+        let mut open = vec![0x01];
+        open.extend_from_slice(&((MAX_STREAM_TARGET_LEN + 1) as u16).to_be_bytes());
+        assert!(StreamOpen::read_from(&mut &open[..]).await.is_err());
+
+        let mut reply = vec![0x00];
+        reply.extend_from_slice(&((MAX_STREAM_MESSAGE_LEN + 1) as u16).to_be_bytes());
+        assert!(StreamReply::read_from(&mut &reply[..]).await.is_err());
+
+        let ok = StreamOpen::Tcp { target: "h:1".into() }.encode();
+        assert_eq!(
+            StreamOpen::read_from(&mut &ok[..]).await.unwrap(),
+            StreamOpen::Tcp { target: "h:1".into() }
+        );
     }
 }

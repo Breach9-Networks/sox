@@ -1,28 +1,144 @@
 use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio::time::Instant;
 
-/// Watches a shared last-activity timestamp and returns once the relay has
-/// been idle (no data in either direction) for `idle`.
+/// Relay copy buffer, one per direction.
+const RELAY_BUF_SIZE: usize = 16 * 1024;
+
+/// Lock-free "time of last activity" shared by both relay directions and the
+/// idle watcher. Stored as milliseconds since `origin`, so the per-write
+/// update on the relay hot path is a single atomic store.
+pub(crate) struct IdleClock {
+    origin: Instant,
+    last_ms: AtomicU64,
+}
+
+impl IdleClock {
+    pub(crate) fn new() -> Self {
+        Self {
+            origin: Instant::now(),
+            last_ms: AtomicU64::new(0),
+        }
+    }
+
+    /// Record activity now.
+    pub(crate) fn touch(&self) {
+        self.last_ms
+            .store(self.origin.elapsed().as_millis() as u64, Ordering::Relaxed);
+    }
+
+    /// Time since the last recorded activity.
+    pub(crate) fn idle_for(&self) -> Duration {
+        let last = Duration::from_millis(self.last_ms.load(Ordering::Relaxed));
+        self.origin.elapsed().saturating_sub(last)
+    }
+}
+
+/// Watches an [`IdleClock`] and returns once it has been idle (no activity in
+/// either direction) for `idle`.
 ///
 /// This is a *true* idle timer: it sleeps for exactly the time remaining
 /// until the idle deadline, so an actively transferring connection wakes the
 /// watcher only about once per `idle` period — cheap even at 10k+ connections.
-pub(crate) async fn idle_watcher(last: Arc<Mutex<Instant>>, idle: Duration) {
+pub(crate) async fn idle_watcher(clock: &IdleClock, idle: Duration) {
     loop {
-        let remaining = {
-            let elapsed = last.lock().unwrap().elapsed();
-            if elapsed >= idle {
-                return;
-            }
-            idle - elapsed
-        };
-        tokio::time::sleep(remaining).await;
+        let elapsed = clock.idle_for();
+        if elapsed >= idle {
+            return;
+        }
+        tokio::time::sleep(idle - elapsed).await;
     }
+}
+
+/// Copy `r` → `w` until EOF, then half-close `w`. Byte counts and the idle
+/// clock are updated after every completed write, so they stay accurate even
+/// if the copy later ends in an error.
+async fn pump<R, W>(
+    r: &mut R,
+    w: &mut W,
+    total: &AtomicU64,
+    live: &[&AtomicU64],
+    clock: &IdleClock,
+) -> io::Result<()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut buf = vec![0u8; RELAY_BUF_SIZE];
+    loop {
+        let n = r.read(&mut buf).await?;
+        if n == 0 {
+            w.shutdown().await?;
+            return Ok(());
+        }
+        w.write_all(&buf[..n]).await?;
+        clock.touch();
+        total.fetch_add(n as u64, Ordering::Relaxed);
+        for counter in live {
+            counter.fetch_add(n as u64, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Shared core of both relay flavours, operating on already-split halves.
+///
+/// `fail_fast` selects what happens when one direction errors: `true` cancels
+/// the other direction immediately (`try_join!`); `false` lets it run to
+/// completion (`join!`) and reports the first error afterwards.
+#[allow(clippy::too_many_arguments)]
+async fn relay_halves<AR, AW, BR, BW>(
+    mut ar: AR,
+    mut aw: AW,
+    mut br: BR,
+    mut bw: BW,
+    live_ab: &[&AtomicU64],
+    live_ba: &[&AtomicU64],
+    idle_timeout: Option<Duration>,
+    fail_fast: bool,
+) -> (u64, u64, io::Result<()>)
+where
+    AR: AsyncRead + Unpin,
+    AW: AsyncWrite + Unpin,
+    BR: AsyncRead + Unpin,
+    BW: AsyncWrite + Unpin,
+{
+    let clock = IdleClock::new();
+    let ab_total = AtomicU64::new(0);
+    let ba_total = AtomicU64::new(0);
+
+    let copy = async {
+        let a_to_b = pump(&mut ar, &mut bw, &ab_total, live_ab, &clock);
+        let b_to_a = pump(&mut br, &mut aw, &ba_total, live_ba, &clock);
+        if fail_fast {
+            tokio::try_join!(a_to_b, b_to_a).map(|_| ())
+        } else {
+            let (r1, r2) = tokio::join!(a_to_b, b_to_a);
+            r1.and(r2)
+        }
+    };
+
+    let outcome = match idle_timeout {
+        Some(idle) if !idle.is_zero() => {
+            tokio::select! {
+                r = copy => r,
+                _ = idle_watcher(&clock, idle) => {
+                    tracing::debug!("relay idle timeout");
+                    Ok(()) // idle close is not an error
+                }
+            }
+        }
+        _ => copy.await,
+    };
+
+    (
+        ab_total.load(Ordering::Relaxed),
+        ba_total.load(Ordering::Relaxed),
+        outcome,
+    )
 }
 
 /// Bidirectional TCP relay with explicit half-close handling
@@ -34,11 +150,12 @@ pub async fn relay_tcp(
     client: &mut TcpStream,
     server: &mut TcpStream,
 ) -> (u64, u64, io::Result<()>) {
-    relay_tcp_live(client, server, None, None, None).await
+    relay_tcp_live(client, server, &[], &[], None).await
 }
 
 /// Relay with live atomic counters that external code can observe
-/// during the relay (e.g., for traffic charts).
+/// during the relay (e.g., for traffic charts). Every counter in `live_tx` /
+/// `live_rx` is bumped after each completed write.
 ///
 /// `idle_timeout` (when set, and non-zero) ends the relay after that long
 /// with no data in *either* direction — a real inactivity timer, not a
@@ -47,85 +164,18 @@ pub async fn relay_tcp(
 ///
 /// Returns `(client_to_server_bytes, server_to_client_bytes, outcome)`.
 /// `outcome` is `Ok(())` on clean EOF or idle close, `Err` on a relay IO
-/// error from either half; byte counts are valid regardless.
+/// error from either half (the other half is cancelled at once); byte counts
+/// are valid regardless.
 pub async fn relay_tcp_live(
     client: &mut TcpStream,
     server: &mut TcpStream,
-    live_tx: Option<&AtomicU64>,
-    live_rx: Option<&AtomicU64>,
+    live_tx: &[&AtomicU64],
+    live_rx: &[&AtomicU64],
     idle_timeout: Option<Duration>,
 ) -> (u64, u64, io::Result<()>) {
-    let (mut cr, mut cw) = client.split();
-    let (mut sr, mut sw) = server.split();
-
-    // Shared counters so we can read totals even if try_join errors
-    let tx_total = Arc::new(AtomicU64::new(0));
-    let rx_total = Arc::new(AtomicU64::new(0));
-
-    let tx_total_c = tx_total.clone();
-    let rx_total_c = rx_total.clone();
-
-    // Shared last-activity timestamp for the idle watcher.
-    let last = Arc::new(Mutex::new(Instant::now()));
-    let last_tx = last.clone();
-    let last_rx = last.clone();
-
-    let c2s = async {
-        let mut buf = [0u8; 16384];
-        loop {
-            let n = cr.read(&mut buf).await?;
-            if n == 0 {
-                sw.shutdown().await?;
-                break;
-            }
-            sw.write_all(&buf[..n]).await?;
-            *last_tx.lock().unwrap() = Instant::now();
-            tx_total_c.fetch_add(n as u64, Ordering::Relaxed);
-            if let Some(counter) = live_tx {
-                counter.fetch_add(n as u64, Ordering::Relaxed);
-            }
-        }
-        Ok::<(), io::Error>(())
-    };
-
-    let s2c = async {
-        let mut buf = [0u8; 16384];
-        loop {
-            let n = sr.read(&mut buf).await?;
-            if n == 0 {
-                cw.shutdown().await?;
-                break;
-            }
-            cw.write_all(&buf[..n]).await?;
-            *last_rx.lock().unwrap() = Instant::now();
-            rx_total_c.fetch_add(n as u64, Ordering::Relaxed);
-            if let Some(counter) = live_rx {
-                counter.fetch_add(n as u64, Ordering::Relaxed);
-            }
-        }
-        Ok::<(), io::Error>(())
-    };
-
-    // try_join! short-circuits on first error; we keep that error so callers
-    // can surface it instead of seeing a silent Ok((bytes, bytes)).
-    let pump = async { tokio::try_join!(c2s, s2c).map(|_| ()) };
-
-    let outcome = match idle_timeout {
-        Some(idle) if !idle.is_zero() => {
-            tokio::select! {
-                r = pump => r,
-                _ = idle_watcher(last, idle) => {
-                    tracing::debug!("TCP relay idle timeout");
-                    Ok(()) // idle close is not an error
-                }
-            }
-        }
-        _ => pump.await,
-    };
-
-    let tx = tx_total.load(Ordering::Relaxed);
-    let rx = rx_total.load(Ordering::Relaxed);
-    (tx, rx, outcome)
+    let (cr, cw) = client.split();
+    let (sr, sw) = server.split();
+    relay_halves(cr, cw, sr, sw, live_tx, live_rx, idle_timeout, true).await
 }
 
 /// 在任兩個雙向串流間 relay，附 live byte 計數。
@@ -133,7 +183,7 @@ pub async fn relay_tcp_live(
 /// 回傳 `(a→b bytes, b→a bytes, outcome)` —— 位元組計數任何情況都正確,
 /// `outcome` 為 `Err` 代表至少一邊出現 IO 錯誤。
 ///
-/// 用 `join!`（非 `try_join!`）讓兩個方向都跑完 —— `try_join!` 會在
+/// 兩個方向都跑完才返回（`join!`，非 `try_join!`）—— `try_join!` 會在
 /// 一邊出錯時中途取消另一邊，可能留下半寫的 frame。兩邊都有錯時
 /// 回報第一個 (a→b 優先)。
 ///
@@ -143,85 +193,17 @@ pub async fn relay_tcp_live(
 pub async fn relay_bidirectional<A, B>(
     a: &mut A,
     b: &mut B,
-    live_ab: Option<&AtomicU64>,
-    live_ba: Option<&AtomicU64>,
+    live_ab: &[&AtomicU64],
+    live_ba: &[&AtomicU64],
     idle_timeout: Option<Duration>,
 ) -> (u64, u64, io::Result<()>)
 where
     A: AsyncRead + AsyncWrite + Unpin,
     B: AsyncRead + AsyncWrite + Unpin,
 {
-    let (mut ar, mut aw) = tokio::io::split(a);
-    let (mut br, mut bw) = tokio::io::split(b);
-
-    let ab_total = Arc::new(AtomicU64::new(0));
-    let ba_total = Arc::new(AtomicU64::new(0));
-    let ab_c = ab_total.clone();
-    let ba_c = ba_total.clone();
-
-    let last = Arc::new(Mutex::new(Instant::now()));
-    let last_ab = last.clone();
-    let last_ba = last.clone();
-
-    let a_to_b = async {
-        let mut buf = [0u8; 16384];
-        loop {
-            let n = ar.read(&mut buf).await?;
-            if n == 0 {
-                bw.shutdown().await?;
-                break;
-            }
-            bw.write_all(&buf[..n]).await?;
-            *last_ab.lock().unwrap() = Instant::now();
-            ab_c.fetch_add(n as u64, Ordering::Relaxed);
-            if let Some(c) = live_ab {
-                c.fetch_add(n as u64, Ordering::Relaxed);
-            }
-        }
-        Ok::<(), io::Error>(())
-    };
-    let b_to_a = async {
-        let mut buf = [0u8; 16384];
-        loop {
-            let n = br.read(&mut buf).await?;
-            if n == 0 {
-                aw.shutdown().await?;
-                break;
-            }
-            aw.write_all(&buf[..n]).await?;
-            *last_ba.lock().unwrap() = Instant::now();
-            ba_c.fetch_add(n as u64, Ordering::Relaxed);
-            if let Some(c) = live_ba {
-                c.fetch_add(n as u64, Ordering::Relaxed);
-            }
-        }
-        Ok::<(), io::Error>(())
-    };
-
-    // join! 兩邊都跑完才返回；取第一個非 Ok 的 result 作為 outcome。
-    let pump = async {
-        let (r1, r2) = tokio::join!(a_to_b, b_to_a);
-        r1.and(r2)
-    };
-
-    let outcome = match idle_timeout {
-        Some(idle) if !idle.is_zero() => {
-            tokio::select! {
-                r = pump => r,
-                _ = idle_watcher(last, idle) => {
-                    tracing::debug!("relay idle timeout");
-                    Ok(())
-                }
-            }
-        }
-        _ => pump.await,
-    };
-
-    (
-        ab_total.load(Ordering::Relaxed),
-        ba_total.load(Ordering::Relaxed),
-        outcome,
-    )
+    let (ar, aw) = tokio::io::split(a);
+    let (br, bw) = tokio::io::split(b);
+    relay_halves(ar, aw, br, bw, live_ab, live_ba, idle_timeout, false).await
 }
 
 #[cfg(test)]
@@ -235,7 +217,7 @@ mod tests {
         let (mut b, mut b_outer) = duplex(1024);
 
         let relay = tokio::spawn(async move {
-            relay_bidirectional(&mut a, &mut b, None, None, None).await
+            relay_bidirectional(&mut a, &mut b, &[], &[], None).await
         });
 
         a_outer.write_all(b"ping").await.unwrap();
@@ -259,7 +241,7 @@ mod tests {
 
         let result = tokio::time::timeout(
             Duration::from_secs(5),
-            relay_bidirectional(&mut a, &mut b, None, None, Some(Duration::from_millis(150))),
+            relay_bidirectional(&mut a, &mut b, &[], &[], Some(Duration::from_millis(150))),
         )
         .await;
 
@@ -275,7 +257,7 @@ mod tests {
         let (mut b, mut b_outer) = duplex(1024);
 
         let relay = tokio::spawn(async move {
-            relay_bidirectional(&mut a, &mut b, None, None, Some(Duration::ZERO)).await
+            relay_bidirectional(&mut a, &mut b, &[], &[], Some(Duration::ZERO)).await
         });
 
         a_outer.write_all(b"data").await.unwrap();
@@ -298,7 +280,7 @@ mod tests {
         let (mut b, b_outer) = duplex(1024);
 
         let relay = tokio::spawn(async move {
-            relay_bidirectional(&mut a, &mut b, None, None, None).await
+            relay_bidirectional(&mut a, &mut b, &[], &[], None).await
         });
 
         // Write something on a → relayed to b_outer.

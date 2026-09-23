@@ -3,32 +3,31 @@
 //! - Client 端：`SessionPool` 維護 N 條 session，接 server 開來的 inbound stream。
 //! - Server 端：`server_session_driver` 驅動一條 session，依請求開 outbound stream。
 
-use std::collections::{HashMap, VecDeque};
 use std::io;
-use std::net::SocketAddr;
 use std::panic::AssertUnwindSafe;
-use std::sync::{Arc, Mutex};
 use std::task::Poll;
 use std::time::{Duration, Instant};
 
 use futures::FutureExt;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::{TcpStream, UdpSocket};
+use tokio::io::AsyncWriteExt;
+use tokio::net::TcpStream;
 use tokio::sync::mpsc;
+use tokio::task::{JoinHandle, JoinSet};
+use tokio::time::MissedTickBehavior;
 use tokio_util::compat::{FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt};
 use tokio_util::sync::CancellationToken;
 use yamux::{Config, Connection, Mode, Stream};
 
-use crate::protocol::addr::TargetAddr;
+use crate::net::{self, KeepaliveParams};
 use crate::protocol::socks5::ReplyCode;
-use crate::relay::tcp::{idle_watcher, relay_bidirectional};
-use crate::relay::udp::{read_udp_datagram, resolve_udp_target};
-use crate::tunnel::apply_tunnel_keepalive;
+use crate::relay::tcp::relay_bidirectional;
+use crate::relay::udp::{UdpOutbound, relay_udp_exit};
 use crate::tunnel::backoff::Backoff;
-use crate::tunnel::noise::{derive_psk, NoiseStream};
+use crate::tunnel::noise::{NoiseStream, derive_psk};
 use crate::tunnel::noise_stream::NoiseByteStream;
-use crate::tunnel::protocol::{Hello, HelloAck, StreamOpen, StreamReply, UdpDatagram, PROTO_VERSION};
+use crate::tunnel::protocol::{Hello, HelloAck, PROTO_VERSION, StreamOpen, StreamReply};
 use crate::tunnel::router::StreamRequest;
+use crate::tunnel::{CLOSE_TIMEOUT, HEARTBEAT_INTERVAL, READ_IDLE_TIMEOUT, configure_tunnel_socket};
 
 /// session 穩定存活超過此時間後，視為「健康」，重連退避歸零。
 const STABLE_AFTER: Duration = Duration::from_secs(30);
@@ -43,40 +42,6 @@ const MAX_RECV_WINDOW: usize = 1024 * 1024 * 1024;
 /// `session_worker` panic 後等多久才重啟,避免「panic → 立即重啟 → 再 panic」
 /// 演變成 100% CPU 迴圈。
 const WORKER_PANIC_BACKOFF: Duration = Duration::from_secs(1);
-
-/// UDP 一條 association 內保留的「resolved dest → 原始目標」上限。超過後
-/// FIFO 汰換最早的 entry。長壽 UDP association 對許多獨立目標時不會無限增長。
-const MAX_UDP_DESTS: usize = 4096;
-
-/// Insertion-order-bounded HashMap for `handle_udp_stream`'s dest tracking.
-/// Overwrites keep the existing FIFO position; new keys push to the back and
-/// pop the front when over the cap.
-struct DestMap {
-    inner: HashMap<SocketAddr, TargetAddr>,
-    order: VecDeque<SocketAddr>,
-}
-
-impl DestMap {
-    fn new() -> Self {
-        Self {
-            inner: HashMap::new(),
-            order: VecDeque::new(),
-        }
-    }
-    fn insert(&mut self, dest: SocketAddr, addr: TargetAddr) {
-        if self.inner.insert(dest, addr).is_none() {
-            self.order.push_back(dest);
-            if self.order.len() > MAX_UDP_DESTS
-                && let Some(oldest) = self.order.pop_front()
-            {
-                self.inner.remove(&oldest);
-            }
-        }
-    }
-    fn get(&self, dest: &SocketAddr) -> Option<&TargetAddr> {
-        self.inner.get(dest)
-    }
-}
 
 /// 依 spec §6 建構 yamux Config。
 ///
@@ -106,6 +71,24 @@ pub fn yamux_config(max_streams: usize, recv_window_mb: usize) -> Config {
     cfg
 }
 
+/// 週期性喚醒 session driver 的 timer(見 [`HEARTBEAT_INTERVAL`])。
+fn heartbeat() -> tokio::time::Interval {
+    let mut interval = tokio::time::interval(HEARTBEAT_INTERVAL);
+    interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    interval
+}
+
+/// 盡力優雅關閉 yamux 連線,但不超過 [`CLOSE_TIMEOUT`]。
+async fn close_connection<T>(conn: &mut Connection<T>)
+where
+    T: futures::AsyncRead + futures::AsyncWrite + Unpin,
+{
+    let close = std::future::poll_fn(|cx| conn.poll_close(cx));
+    if tokio::time::timeout(CLOSE_TIMEOUT, close).await.is_err() {
+        tracing::debug!("yamux close timed out (peer unresponsive)");
+    }
+}
+
 // ───────────────────────── Client 端 ─────────────────────────
 
 /// `SessionPool` 的可調參數。
@@ -125,6 +108,10 @@ pub struct SessionPoolConfig {
     pub connect_timeout: Duration,
     /// relay 的閒置逾時（兩個方向都無資料）。
     pub idle_timeout: Duration,
+    /// UDP 目標的 DNS 解析逾時。
+    pub dns_timeout: Duration,
+    /// shutdown 時等進行中 relay 跑完的上限。
+    pub drain_timeout: Duration,
 }
 
 /// Client 端的 yamux session 連線池。
@@ -156,45 +143,47 @@ impl SessionPool {
 
     /// 啟動連線池 —— 為每條 session spawn 一個獨立維護的 worker,
     /// 並用 `catch_unwind` 監控:worker 若 panic,等 1s 後自動重啟,
-    /// 避免單一未預期錯誤永久損失一個 session slot。
-    pub fn start(&self, cancel: CancellationToken) {
-        for index in 0..self.cfg.sessions {
-            let server_addr = self.server_addr.clone();
-            let client_id = self.client_id.clone();
-            let psk = self.psk;
-            let cfg = self.cfg.clone();
-            let cancel = cancel.clone();
-            tokio::spawn(async move {
-                loop {
-                    let worker = session_worker(
-                        index,
-                        server_addr.clone(),
-                        client_id.clone(),
-                        psk,
-                        cfg.clone(),
-                        cancel.clone(),
-                    );
-                    match AssertUnwindSafe(worker).catch_unwind().await {
-                        Ok(()) => return, // session_worker 自己 cancel-clean 退出
-                        Err(panic_payload) => {
-                            tracing::error!(
-                                index,
-                                payload = ?panic_payload_str(&panic_payload),
-                                "session_worker panicked, restarting after backoff"
-                            );
-                            if cancel.is_cancelled() {
-                                return;
+    /// 避免單一未預期錯誤永久損失一個 session slot。(release profile 必須是
+    /// `panic = "unwind"`,否則這層監控形同虛設。)
+    ///
+    /// 回傳各 worker 的 handle:`cancel` 之後 await 它們,即等同等所有 session
+    /// 把進行中的 relay drain 完(上限 `drain_timeout`)。
+    pub fn start(&self, cancel: CancellationToken) -> Vec<JoinHandle<()>> {
+        (0..self.cfg.sessions)
+            .map(|index| {
+                let server_addr = self.server_addr.clone();
+                let client_id = self.client_id.clone();
+                let psk = self.psk;
+                let cfg = self.cfg.clone();
+                let cancel = cancel.clone();
+                tokio::spawn(async move {
+                    loop {
+                        let worker = session_worker(
+                            index,
+                            server_addr.clone(),
+                            client_id.clone(),
+                            psk,
+                            cfg.clone(),
+                            cancel.clone(),
+                        );
+                        match AssertUnwindSafe(worker).catch_unwind().await {
+                            Ok(()) => return, // session_worker 自己 cancel-clean 退出
+                            Err(panic_payload) => {
+                                tracing::error!(
+                                    index,
+                                    payload = ?panic_payload_str(&panic_payload),
+                                    "session_worker panicked, restarting after backoff"
+                                );
+                                tokio::select! {
+                                    _ = cancel.cancelled() => return,
+                                    _ = tokio::time::sleep(WORKER_PANIC_BACKOFF) => {}
+                                }
                             }
-                            tokio::time::sleep(WORKER_PANIC_BACKOFF).await;
-                            if cancel.is_cancelled() {
-                                return;
-                            }
-                            // 迴圈重啟 worker
                         }
                     }
-                }
-            });
-        }
+                })
+            })
+            .collect()
     }
 }
 
@@ -250,6 +239,10 @@ async fn session_worker(
 ///
 /// 回傳 `Ok(())` 僅代表「乾淨取消」；任何其他結束（含對端關閉）回 `Err`，
 /// 讓 worker 重連。
+///
+/// **取消 = drain,不是中斷**:收到 cancel 後不再接新 stream,但繼續驅動 yamux
+/// 連線,直到進行中的 relay 全部結束或 `drain_timeout` 到期 —— 連線一旦停止
+/// 被 poll,其上所有 stream 就全部卡死,等於把傳輸中的 flow 攔腰砍斷。
 async fn run_client_session(
     index: u16,
     server_addr: &str,
@@ -269,10 +262,8 @@ async fn run_client_session(
     let tcp = tokio::time::timeout_at(deadline, TcpStream::connect(server_addr))
         .await
         .map_err(|_| to_err("connect"))??;
-    tcp.set_nodelay(true)?;
-    // 半開死連線偵測 —— tunnel socket 啟用 OS 層 TCP keepalive。
-    // keepalive 設定失敗（極罕見）不該讓整條 session 重連，故寬容處理。
-    let _ = apply_tunnel_keepalive(&tcp);
+    // socket 選項設定失敗（極罕見）不該讓整條 session 重連，故寬容處理。
+    let _ = configure_tunnel_socket(&tcp);
 
     // Noise 握手。
     let mut noise = tokio::time::timeout_at(deadline, NoiseStream::connect(tcp, psk))
@@ -301,50 +292,91 @@ async fn run_client_session(
     }
 
     // 轉成位元組流，疊上 yamux（client 端為 Mode::Client，接 inbound stream）。
-    let compat = noise.into_byte_stream().compat();
+    let byte_stream = noise.into_byte_stream().with_read_idle_timeout(READ_IDLE_TIMEOUT);
     let mut conn = Connection::new(
-        compat,
+        byte_stream.compat(),
         yamux_config(cfg.max_streams, cfg.recv_window_mb),
         Mode::Client,
     );
 
     tracing::info!(index, "tunnel session established");
 
-    let connect_timeout = cfg.connect_timeout;
-    let idle_timeout = cfg.idle_timeout;
+    // 進行中的 stream。session 以錯誤結束時 JoinSet 被 drop、全部 abort ——
+    // 連線沒了,它們也不可能再有進展。
+    let mut streams = JoinSet::new();
+    let mut heartbeat = heartbeat();
+    let mut draining = false;
+    let drain_deadline = tokio::time::sleep(Duration::ZERO);
+    tokio::pin!(drain_deadline);
+
     loop {
+        if draining && streams.is_empty() {
+            break;
+        }
         let inbound = tokio::select! {
             biased;
-            _ = cancel.cancelled() => break,
+            _ = cancel.cancelled(), if !draining => {
+                draining = true;
+                drain_deadline
+                    .as_mut()
+                    .reset(tokio::time::Instant::now() + cfg.drain_timeout);
+                tracing::info!(index, in_flight = streams.len(), "tunnel session draining");
+                continue;
+            }
+            _ = &mut drain_deadline, if draining => {
+                tracing::warn!(index, remaining = streams.len(), "drain timeout, aborting relays");
+                streams.abort_all();
+                break;
+            }
+            // 回收結束的 stream task,JoinSet 才不會無限累積。
+            Some(_) = streams.join_next(), if !streams.is_empty() => continue,
+            _ = heartbeat.tick() => continue,
             inbound = std::future::poll_fn(|cx| conn.poll_next_inbound(cx)) => inbound,
         };
         match inbound {
+            // drain 期間不接新 flow —— drop 即 reset 該 stream。
+            Some(Ok(stream)) if draining => drop(stream),
             Some(Ok(stream)) => {
-                tokio::spawn(handle_inbound_stream(stream, connect_timeout, idle_timeout));
+                streams.spawn(handle_inbound_stream(stream, cfg.clone()));
             }
             Some(Err(e)) => return Err(io::Error::other(format!("yamux: {e}"))),
             None => return Err(io::Error::other("session closed by peer")),
         }
     }
 
-    // 被取消 —— 盡力優雅關閉。
-    let _ = std::future::poll_fn(|cx| conn.poll_close(cx)).await;
+    close_connection(&mut conn).await;
     Ok(())
+}
+
+/// Dial 一個 `"host:port"` 目標:解析出全部位址後依序嘗試(見
+/// [`net::connect_any`]),整體不超過 `deadline`。
+async fn dial_target(target: &str, deadline: tokio::time::Instant) -> io::Result<TcpStream> {
+    let timed_out = || io::Error::new(io::ErrorKind::TimedOut, "connect timeout");
+    let addrs: Vec<_> = tokio::time::timeout_at(deadline, tokio::net::lookup_host(target))
+        .await
+        .map_err(|_| timed_out())??
+        .collect();
+    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+    if remaining.is_zero() {
+        return Err(timed_out());
+    }
+    let stream = net::connect_any(&addrs, remaining).await?;
+    // 目標端同樣需要半開偵測,否則只能等 idle_timeout。設定失敗不致命。
+    let _ = net::configure_stream(&stream, &KeepaliveParams::PROXY_DEFAULT);
+    Ok(stream)
 }
 
 /// 處理一條 server 開來的 inbound stream：讀 preamble → dial 目標 → relay。
 ///
 /// `connect_timeout` 是「讀 preamble + dial 目標」的**共用** budget(用
-/// `timeout_at` 同一 deadline 切分),不再是「每階段一份」—— 避免單一
-/// stream 因為兩階段各拿一份逾時而把總時間放大成 2× connect_timeout,
-/// 削弱了原本對慢速攻擊的保護。
-/// `idle_timeout` 限制 relay 的閒置時間。
-async fn handle_inbound_stream(stream: Stream, connect_timeout: Duration, idle_timeout: Duration) {
+/// 同一 deadline 切分),不是「每階段一份」—— 避免單一 stream 把總時間放大成
+/// 2× connect_timeout,削弱對慢速攻擊的保護。
+async fn handle_inbound_stream(stream: Stream, cfg: SessionPoolConfig) {
     let mut io = stream.compat(); // futures -> tokio
-    let deadline = tokio::time::Instant::now() + connect_timeout;
+    let deadline = tokio::time::Instant::now() + cfg.connect_timeout;
 
     // preamble 必須在 server 開 stream 後迅速到達；逾時或出錯即放棄。
-    let open = match tokio::time::timeout_at(deadline, read_stream_open(&mut io)).await {
+    let open = match tokio::time::timeout_at(deadline, StreamOpen::read_from(&mut io)).await {
         Ok(Ok(o)) => o,
         Ok(Err(e)) => {
             tracing::debug!(error = %e, "failed to read StreamOpen preamble");
@@ -357,176 +389,62 @@ async fn handle_inbound_stream(stream: Stream, connect_timeout: Duration, idle_t
     };
 
     match open {
-        StreamOpen::Tcp { target } => {
-            match tokio::time::timeout_at(deadline, TcpStream::connect(&target)).await {
-                Ok(Ok(mut target_stream)) => {
-                    let _ = target_stream.set_nodelay(true);
-                    let bind = target_stream
-                        .local_addr()
-                        .map(|a| a.to_string())
-                        .unwrap_or_default();
-                    let reply = StreamReply { status: 0, message: bind };
-                    if io.write_all(&reply.encode()).await.is_err() {
-                        return;
-                    }
-                    tracing::debug!(%target, "tunnel TCP flow connected, relaying");
-                    let (c2s, s2c, outcome) = relay_bidirectional(
-                        &mut io,
-                        &mut target_stream,
-                        None,
-                        None,
-                        Some(idle_timeout),
-                    )
-                    .await;
-                    if let Err(e) = outcome {
-                        tracing::debug!(%target, c2s, s2c, error = %e, "tunnel TCP relay error");
-                    } else {
-                        tracing::trace!(%target, c2s, s2c, "tunnel TCP relay finished");
-                    }
+        StreamOpen::Tcp { target } => match dial_target(&target, deadline).await {
+            Ok(mut target_stream) => {
+                let bind = target_stream
+                    .local_addr()
+                    .map(|a| a.to_string())
+                    .unwrap_or_default();
+                let reply = StreamReply { status: 0, message: bind };
+                if io.write_all(&reply.encode()).await.is_err() {
+                    return;
                 }
-                Ok(Err(e)) => {
-                    tracing::debug!(%target, error = %e, "tunnel TCP connect failed");
+                tracing::debug!(%target, "tunnel TCP flow connected, relaying");
+                let (c2s, s2c, outcome) = relay_bidirectional(
+                    &mut io,
+                    &mut target_stream,
+                    &[],
+                    &[],
+                    Some(cfg.idle_timeout),
+                )
+                .await;
+                if let Err(e) = outcome {
+                    tracing::debug!(%target, c2s, s2c, error = %e, "tunnel TCP relay error");
+                } else {
+                    tracing::trace!(%target, c2s, s2c, "tunnel TCP relay finished");
+                }
+            }
+            Err(e) => {
+                tracing::debug!(%target, error = %e, "tunnel TCP connect failed");
+                let reply = StreamReply {
+                    status: ReplyCode::for_connect_error(&e) as u8,
+                    message: e.to_string(),
+                };
+                let _ = io.write_all(&reply.encode()).await;
+            }
+        },
+        StreamOpen::Udp => {
+            let outbound = match UdpOutbound::bind(cfg.dns_timeout).await {
+                Ok(o) => o,
+                Err(e) => {
+                    tracing::debug!(error = %e, "UDP socket bind failed");
                     let reply = StreamReply {
-                        status: ReplyCode::for_connect_error(&e) as u8,
+                        status: ReplyCode::GeneralFailure as u8,
                         message: e.to_string(),
                     };
                     let _ = io.write_all(&reply.encode()).await;
+                    return;
                 }
-                Err(_) => {
-                    tracing::debug!(%target, "tunnel TCP connect timed out");
-                    let reply = StreamReply {
-                        status: ReplyCode::TtlExpired as u8,
-                        message: "connect timeout".into(),
-                    };
-                    let _ = io.write_all(&reply.encode()).await;
-                }
+            };
+            let reply = StreamReply { status: 0, message: String::new() };
+            if io.write_all(&reply.encode()).await.is_err() {
+                return;
+            }
+            tracing::debug!("tunnel UDP flow established");
+            if let Err(e) = relay_udp_exit(io, outbound, cfg.idle_timeout).await {
+                tracing::debug!(error = %e, "tunnel UDP flow ended with error");
             }
         }
-        StreamOpen::Udp => {
-            handle_udp_stream(io, idle_timeout).await;
-        }
-    }
-}
-
-/// 處理一條 UDP-over-tunnel stream：回 reply、bind UDP socket、雙向橋接。
-///
-/// 用 `idle_timeout` 看守整條 flow —— 無資料達該時間即收工，避免閒置的
-/// UDP socket 與 yamux stream 永久洩漏。
-async fn handle_udp_stream<S>(mut io: S, idle_timeout: Duration)
-where
-    S: AsyncRead + AsyncWrite + Unpin,
-{
-    let socket = match UdpSocket::bind("0.0.0.0:0").await {
-        Ok(s) => Arc::new(s),
-        Err(e) => {
-            tracing::debug!(error = %e, "UDP socket bind failed");
-            return;
-        }
-    };
-    let reply = StreamReply { status: 0, message: String::new() };
-    if io.write_all(&reply.encode()).await.is_err() {
-        return;
-    }
-    tracing::debug!("tunnel UDP flow established");
-
-    // `resolved dest -> SOCKS client 原始目標位址`。回程據此 (a) 只接受曾
-    // 送達目標的來源回包,(b) 還原 client 當初使用的位址(可能是網域)。
-    // FIFO-bounded(MAX_UDP_DESTS):長壽 association 對許多目標時不會無限增長。
-    let dests: Arc<Mutex<DestMap>> = Arc::new(Mutex::new(DestMap::new()));
-    // 共用的最後活動時間戳。**bind + reply 之後**才取樣 —— 否則「等 client
-    // 第一筆 datagram」的時間會錯計成 idle,可能在 association 還沒被用過
-    // 之前就誤觸 idle_watcher。
-    let last = Arc::new(Mutex::new(Instant::now()));
-
-    let (sr, sw) = tokio::io::split(io);
-    tokio::select! {
-        _ = client_udp_t2s(sr, socket.clone(), dests.clone(), last.clone()) => {}
-        _ = client_udp_s2t(sw, socket, dests, last.clone()) => {}
-        _ = idle_watcher(last, idle_timeout) => {
-            tracing::debug!("tunnel UDP flow idle, closing");
-        }
-    }
-}
-
-/// tunnel stream → 真實 UDP socket：讀 datagram、解析目標、發出。
-async fn client_udp_t2s<R>(
-    mut sr: R,
-    socket: Arc<UdpSocket>,
-    dests: Arc<Mutex<DestMap>>,
-    last: Arc<Mutex<Instant>>,
-) -> io::Result<()>
-where
-    R: AsyncRead + Unpin,
-{
-    loop {
-        let dat = read_udp_datagram(&mut sr).await?;
-        // 收到 datagram 本身就算「活動」—— 在 DNS resolve **之前**就更新
-        // last,否則慢 DNS 會悄悄吃掉 idle 預算,active flow 也可能被 idle
-        // watcher 砍掉,違反 CLAUDE.md priority #1 (connection stability)。
-        *last.lock().unwrap() = Instant::now();
-        let dest = match resolve_udp_target(&dat.addr).await {
-            Ok(a) => a,
-            Err(_) => continue,
-        };
-        // 記下「resolved dest → 原始目標」，供回程過濾與位址還原。
-        dests.lock().unwrap().insert(dest, dat.addr.clone());
-        socket.send_to(&dat.payload, dest).await?;
-    }
-}
-
-/// 真實 UDP socket → tunnel stream：收回包、framing 後送回。
-///
-/// 只轉送「我們確實送過封包」的目標來的回包（S1：來源過濾），且回程
-/// 的位址欄沿用 SOCKS client 當初使用的目標位址（A6：保留網域）。
-async fn client_udp_s2t<W>(
-    mut sw: W,
-    socket: Arc<UdpSocket>,
-    dests: Arc<Mutex<DestMap>>,
-    last: Arc<Mutex<Instant>>,
-) -> io::Result<()>
-where
-    W: AsyncWrite + Unpin,
-{
-    let mut buf = vec![0u8; 65535];
-    loop {
-        let (n, src) = socket.recv_from(&mut buf).await?;
-        // 取出原始目標位址；來源不在已送達集合內就丟棄（防回應注入）。
-        let addr = match dests.lock().unwrap().get(&src).cloned() {
-            Some(orig) => orig,
-            None => continue,
-        };
-        *last.lock().unwrap() = Instant::now();
-        let dat = UdpDatagram {
-            addr,
-            payload: buf[..n].to_vec(),
-        };
-        sw.write_all(&dat.encode()).await?;
-    }
-}
-
-/// 從 stream 開頭精確讀出 `StreamOpen` preamble（自帶長度，不會超讀）。
-async fn read_stream_open<S>(s: &mut S) -> io::Result<StreamOpen>
-where
-    S: tokio::io::AsyncRead + Unpin,
-{
-    let mut kind = [0u8; 1];
-    s.read_exact(&mut kind).await?;
-    match kind[0] {
-        0x01 => {
-            let mut len = [0u8; 2];
-            s.read_exact(&mut len).await?;
-            let n = u16::from_be_bytes(len) as usize;
-            let mut target = vec![0u8; n];
-            s.read_exact(&mut target).await?;
-            Ok(StreamOpen::Tcp {
-                target: String::from_utf8_lossy(&target).into_owned(),
-            })
-        }
-        0x02 => Ok(StreamOpen::Udp),
-        other => Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("unknown StreamOpen kind {other:#x}"),
-        )),
     }
 }
 
@@ -541,7 +459,8 @@ where
 /// 而 credit-bound 寫入卡死 —— 就是 D1 fix 原本要根治的死鎖。
 ///
 /// `made_progress` 旗標讓 loop 只在「真的有東西動」時 continue,沒進度
-/// 就回 Pending 等 waker,避免空轉。
+/// 就回 Pending 等 waker,避免空轉。heartbeat tick 也算進度:它的作用就是
+/// 讓閒置連線也定期被 poll(見 [`HEARTBEAT_INTERVAL`])。
 pub async fn server_session_driver(
     byte_stream: NoiseByteStream,
     mut open_rx: mpsc::Receiver<StreamRequest>,
@@ -549,14 +468,15 @@ pub async fn server_session_driver(
     recv_window_mb: usize,
     cancel: CancellationToken,
 ) {
-    let compat = byte_stream.compat();
+    let byte_stream = byte_stream.with_read_idle_timeout(READ_IDLE_TIMEOUT);
     let mut conn = Connection::new(
-        compat,
+        byte_stream.compat(),
         yamux_config(max_streams, recv_window_mb),
         Mode::Server,
     );
     // 目前手上待處理的「開 outbound stream」請求（一次處理一個）。
     let mut pending: Option<StreamRequest> = None;
+    let mut heartbeat = heartbeat();
 
     tokio::select! {
         biased;
@@ -565,6 +485,11 @@ pub async fn server_session_driver(
             loop {
                 let mut made_progress = false;
 
+                // 0. heartbeat 到期 → 本輪照常 poll 連線(yamux 藉此送 ping)。
+                while heartbeat.poll_tick(cx).is_ready() {
+                    made_progress = true;
+                }
+
                 // 1. **每輪先** poll inbound,確保 ACK / window-update 一定
                 //    被讀出,即使下面有大量 outbound open 要服務。
                 match conn.poll_next_inbound(cx) {
@@ -572,9 +497,11 @@ pub async fn server_session_driver(
                         drop(s); // server 不預期 inbound stream
                         made_progress = true;
                     }
-                    Poll::Ready(Some(Err(_))) | Poll::Ready(None) => {
+                    Poll::Ready(Some(Err(e))) => {
+                        tracing::debug!(error = %e, "tunnel session failed");
                         return Poll::Ready(());
                     }
+                    Poll::Ready(None) => return Poll::Ready(()),
                     Poll::Pending => {}
                 }
 
@@ -610,7 +537,7 @@ pub async fn server_session_driver(
         }) => {}
     }
 
-    let _ = std::future::poll_fn(|cx| conn.poll_close(cx)).await;
+    close_connection(&mut conn).await;
 }
 
 #[cfg(test)]
@@ -627,39 +554,5 @@ mod tests {
         let _ = yamux_config(0, 0);
         let _ = yamux_config(usize::MAX, usize::MAX);
         let _ = yamux_config(1_000_000, 10_000_000);
-    }
-
-    #[test]
-    fn dest_map_evicts_oldest_when_over_cap() {
-        // #14 regression: DestMap must bound its size via FIFO eviction,
-        // not grow without limit.
-        let mut m = DestMap::new();
-        for i in 0..MAX_UDP_DESTS {
-            let addr: SocketAddr = format!("10.0.0.1:{}", i % 65535 + 1).parse().unwrap();
-            m.insert(addr, TargetAddr::Ip(addr));
-        }
-        assert_eq!(m.inner.len(), MAX_UDP_DESTS);
-        let oldest: SocketAddr = "10.0.0.1:1".parse().unwrap();
-        assert!(m.get(&oldest).is_some());
-
-        // One more insert pushes us over the cap and evicts the oldest.
-        let new_addr: SocketAddr = "10.0.0.99:9999".parse().unwrap();
-        m.insert(new_addr, TargetAddr::Ip(new_addr));
-        assert_eq!(m.inner.len(), MAX_UDP_DESTS);
-        assert!(m.get(&oldest).is_none(), "oldest entry should be evicted");
-        assert!(m.get(&new_addr).is_some());
-    }
-
-    #[test]
-    fn dest_map_repeat_insert_keeps_size() {
-        // Re-inserting the same key must not push to the FIFO order again
-        // or grow the map.
-        let mut m = DestMap::new();
-        let addr: SocketAddr = "10.0.0.1:1234".parse().unwrap();
-        m.insert(addr, TargetAddr::Ip(addr));
-        m.insert(addr, TargetAddr::Ip(addr));
-        m.insert(addr, TargetAddr::Ip(addr));
-        assert_eq!(m.inner.len(), 1);
-        assert_eq!(m.order.len(), 1);
     }
 }

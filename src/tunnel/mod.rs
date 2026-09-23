@@ -9,58 +9,27 @@ pub mod session;
 
 use std::time::Duration;
 
-/// 對 tunnel session 的底層 TCP socket 啟用 OS 層 keepalive。
-///
-/// 用來偵測「半開死連線」—— 對端斷電、或 NAT/防火牆靜默丟棄閒置流
-/// （無 FIN/RST）。yamux 對閒置連線不主動送 ping，故需靠 kernel 探測；
-/// 探測失敗會讓底層 socket 報錯，session driver 隨之結束、觸發重連。
-///
-/// **目標偵測窗:** idle 20s + interval 5s × 3 probes ≈ 35s。
-///
-/// **跨平台一致性:** socket2 0.5 的 `with_retries` 只在 Linux/Android,
-/// 我們在所有 unix(含 macOS、musl)用 libc setsockopt 直接設 TCP_KEEPCNT,
-/// 確保偵測窗一致。Windows 無 per-socket 介面(系統層
-/// `TcpMaxDataRetransmissions`,通常 5-10),會退到 OS 預設,偵測窗約
-/// 45-70s。
-pub fn apply_tunnel_keepalive(stream: &tokio::net::TcpStream) -> std::io::Result<()> {
-    let keepalive = socket2::TcpKeepalive::new()
-        .with_time(Duration::from_secs(20))
-        .with_interval(Duration::from_secs(5));
-    socket2::SockRef::from(stream).set_tcp_keepalive(&keepalive)?;
-    set_keepalive_probes(stream, 3);
-    Ok(())
-}
+/// session driver 喚醒 yamux 的週期。yamux 0.13 的 RTT ping 沒有自己的 timer ——
+/// 連線不被 poll 就不會送。閒置 session 因此完全沒有流量,半開連線也就無從
+/// 偵測。driver 每隔這段時間 poll 一次,讓 ping(及對端的 pong)持續流動。
+pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 
-/// 在 unix 平台直接以 libc::setsockopt 設定 `TCP_KEEPCNT`(探測次數)。
-///
-/// `socket2` 的 `TcpKeepalive::with_retries` 只在 Linux/Android 可用,
-/// macOS / musl Linux 因而拿不到自訂值。這個 helper 用 libc 直接呼叫
-/// setsockopt,把支援平台統一到所有 unix。失敗只 log 不傳染。
-///
-/// Windows 無此功能,空實作。
-#[cfg(unix)]
-pub(crate) fn set_keepalive_probes(stream: &tokio::net::TcpStream, count: u32) {
-    use std::os::fd::AsRawFd;
-    let retries: libc::c_int = count as libc::c_int;
-    let ret = unsafe {
-        libc::setsockopt(
-            stream.as_raw_fd(),
-            libc::IPPROTO_TCP,
-            libc::TCP_KEEPCNT,
-            &retries as *const _ as *const libc::c_void,
-            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-        )
-    };
-    if ret != 0 {
-        tracing::debug!(
-            error = %std::io::Error::last_os_error(),
-            "TCP_KEEPCNT setsockopt failed; using OS default probe count"
-        );
-    }
-}
+/// tunnel socket 多久沒收到任何位元組就視為已死(見 `NoiseByteStream` 的讀取
+/// 看門狗)。容得下數次 heartbeat 遺失 —— 雙方各自每 `HEARTBEAT_INTERVAL` 送
+/// ping,健康連線的靜默期不會超過一個週期加 RTT。
+pub const READ_IDLE_TIMEOUT: Duration = Duration::from_secs(45);
 
-#[cfg(not(unix))]
-pub(crate) fn set_keepalive_probes(_stream: &tokio::net::TcpStream, _count: u32) {
-    // Windows: TCP_KEEPCNT is not exposed per-socket; falls back to the
-    // system-wide TcpMaxDataRetransmissions registry value.
+/// 優雅關閉 yamux 連線(GoAway + flush)的時間上限 —— 對端已死時 flush 可能
+/// 永遠等不到,不可因此卡住 shutdown。
+pub const CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// 對 tunnel session 的底層 TCP socket 設定 NODELAY 與 OS 層 keepalive。
+///
+/// 半開死連線有兩層偵測:
+/// 1. **OS keepalive**([`KeepaliveParams::TUNNEL`],約 35s)—— 連線閒置時有效。
+///    Windows 無 per-socket 探測次數介面,偵測窗約 45-70s。
+/// 2. **讀取看門狗**([`READ_IDLE_TIMEOUT`])—— 有未 ACK 資料時 keepalive 不探測
+///    (由 RTO 決定,可達 ~15 分鐘),這層補上該缺口,且跨平台一致。
+pub fn configure_tunnel_socket(stream: &tokio::net::TcpStream) -> std::io::Result<()> {
+    crate::net::configure_stream(stream, &crate::net::KeepaliveParams::TUNNEL)
 }

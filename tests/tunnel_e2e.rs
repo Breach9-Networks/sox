@@ -93,10 +93,22 @@ fn start_client(
     recv_window_mb: usize,
     cancel: CancellationToken,
 ) {
+    start_client_as("e2e-client", SECRET, tunnel_port, sessions, max_streams, recv_window_mb, cancel);
+}
+
+fn start_client_as(
+    client_id: &str,
+    secret: &str,
+    tunnel_port: u16,
+    sessions: u16,
+    max_streams: usize,
+    recv_window_mb: usize,
+    cancel: CancellationToken,
+) -> tokio::task::JoinHandle<()> {
     let cfg = sox::client::ClientConfig {
         server_addr: format!("127.0.0.1:{tunnel_port}"),
-        secret: SECRET.to_string(),
-        client_id: "e2e-client".into(),
+        secret: secret.to_string(),
+        client_id: client_id.into(),
         tunnel_sessions: sessions,
         max_streams,
         recv_window_mb,
@@ -104,18 +116,34 @@ fn start_client(
         reconnect_max: Duration::from_secs(2),
         connect_timeout: Duration::from_secs(10),
         idle_timeout: Duration::from_secs(300),
+        dns_timeout: Duration::from_secs(5),
+        drain_timeout: Duration::from_secs(10),
     };
-    tokio::spawn(sox::client::run_client(cfg, cancel));
+    tokio::spawn(sox::client::run_client(cfg, cancel))
 }
 
 fn start_standalone(socks_port: u16, cancel: CancellationToken) {
+    start_standalone_with(socks_port, sox::config::Config::default(), cancel);
+}
+
+fn start_standalone_with(socks_port: u16, config: sox::config::Config, cancel: CancellationToken) {
     let config = sox::config::Config {
         listen_addr: format!("127.0.0.1:{socks_port}").parse().unwrap(),
-        ..sox::config::Config::default()
+        ..config
     };
     tokio::spawn(async move {
         let _ = sox::server::run_standalone(config, cancel).await;
     });
+}
+
+/// Start a standalone proxy with `config`; returns its address and cancel token.
+async fn spawn_standalone(config: sox::config::Config) -> (SocketAddr, CancellationToken) {
+    let (socks_port, _) = two_free_ports().await;
+    let proxy: SocketAddr = format!("127.0.0.1:{socks_port}").parse().unwrap();
+    let cancel = CancellationToken::new();
+    start_standalone_with(socks_port, config, cancel.clone());
+    wait_for_listener(proxy).await;
+    (proxy, cancel)
 }
 
 fn start_standalone_with_auth(socks_port: u16, user: &str, pass: &str, cancel: CancellationToken) {
@@ -588,5 +616,352 @@ async fn socks5_userpass_request_arriving_fragmented() {
     s.read_exact(&mut reply).await.unwrap();
     assert_eq!(reply[1], 0x00);
 
+    cancel.cancel();
+}
+
+// ───────────────────────── Round 3 regressions ─────────────────────────
+
+/// A12: a SOCKS4a request dribbling in one fragment at a time must still be
+/// served. `localhost` may resolve to `::1` first while the echo server only
+/// listens on 127.0.0.1 — the dialer has to fall through to the next address.
+#[tokio::test]
+async fn socks4a_request_arriving_fragmented() {
+    let echo = spawn_tcp_echo().await;
+    let (proxy, cancel) = spawn_standalone(sox::config::Config::default()).await;
+
+    let mut s = TcpStream::connect(proxy).await.unwrap();
+    let port = echo.port().to_be_bytes();
+    let fragments: [&[u8]; 5] = [
+        &[0x04, 0x01, port[0], port[1]],
+        &[0, 0, 0, 1], // 0.0.0.x → SOCKS4a, a domain follows the user id
+        b"some-user",
+        &[0x00],
+        b"localhost\0",
+    ];
+    for fragment in fragments {
+        s.write_all(fragment).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(60)).await;
+    }
+
+    let mut reply = [0u8; 8];
+    s.read_exact(&mut reply).await.unwrap();
+    assert_eq!(reply[1], 0x5a, "SOCKS4a request was not granted");
+
+    s.write_all(b"ping").await.unwrap();
+    let mut got = [0u8; 4];
+    s.read_exact(&mut got).await.unwrap();
+    assert_eq!(&got, b"ping");
+    cancel.cancel();
+}
+
+/// A12: bytes a client pipelines right behind its CONNECT request belong to
+/// the relay — the handshake must not swallow them.
+#[tokio::test]
+async fn socks5_payload_pipelined_behind_request_is_not_lost() {
+    let echo = spawn_tcp_echo().await;
+    let (proxy, cancel) = spawn_standalone(sox::config::Config::default()).await;
+
+    let mut s = TcpStream::connect(proxy).await.unwrap();
+    s.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+    let mut greeting = [0u8; 2];
+    s.read_exact(&mut greeting).await.unwrap();
+
+    let std::net::IpAddr::V4(ip) = echo.ip() else { panic!("tests use IPv4") };
+    let mut req = vec![0x05, 0x01, 0x00, 0x01];
+    req.extend_from_slice(&ip.octets());
+    req.extend_from_slice(&echo.port().to_be_bytes());
+    req.extend_from_slice(b"early-bytes"); // same segment as the request
+    s.write_all(&req).await.unwrap();
+
+    let mut reply = [0u8; 10];
+    s.read_exact(&mut reply).await.unwrap();
+    assert_eq!(reply[1], 0x00);
+
+    let mut got = [0u8; 11];
+    tokio::time::timeout(Duration::from_secs(3), s.read_exact(&mut got))
+        .await
+        .expect("pipelined payload was swallowed by the handshake")
+        .unwrap();
+    assert_eq!(&got, b"early-bytes");
+    cancel.cancel();
+}
+
+/// A12: the handshake timeout is one budget for the whole negotiation, not a
+/// fresh one per phase.
+#[tokio::test]
+async fn handshake_timeout_covers_all_phases_together() {
+    let (proxy, cancel) = spawn_standalone(sox::config::Config {
+        handshake_timeout: Duration::from_millis(600),
+        ..sox::config::Config::default()
+    })
+    .await;
+
+    let mut s = TcpStream::connect(proxy).await.unwrap();
+    s.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+    let mut greeting = [0u8; 2];
+    s.read_exact(&mut greeting).await.unwrap();
+
+    // Each phase on its own stays under 600ms; together they do not.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    s.write_all(&[0x05, 0x01, 0x00, 0x01]).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    let mut buf = [0u8; 1];
+    let closed = tokio::time::timeout(Duration::from_secs(1), s.read(&mut buf)).await;
+    assert!(
+        matches!(closed, Ok(Ok(0)) | Ok(Err(_))),
+        "slow client should have been cut off at the shared deadline, got {closed:?}"
+    );
+    cancel.cancel();
+}
+
+/// A4: `idle_timeout` on a UDP association is an inactivity timer. An
+/// association that stays busy for several times the timeout must survive,
+/// and one that goes quiet must then be closed.
+#[tokio::test]
+async fn udp_association_idle_timeout_is_inactivity_not_wall_clock() {
+    let echo = spawn_udp_echo().await;
+    let (proxy, cancel) = spawn_standalone(sox::config::Config {
+        idle_timeout: Duration::from_secs(1),
+        ..sox::config::Config::default()
+    })
+    .await;
+
+    let mut ctrl = TcpStream::connect(proxy).await.unwrap();
+    ctrl.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+    let mut greeting = [0u8; 2];
+    ctrl.read_exact(&mut greeting).await.unwrap();
+    ctrl.write_all(&[0x05, 0x03, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await.unwrap();
+    let mut reply = [0u8; 10];
+    ctrl.read_exact(&mut reply).await.unwrap();
+    assert_eq!(reply[1], 0x00);
+    assert_eq!(&reply[4..8], &[127, 0, 0, 1], "BND.ADDR must be reachable, not 0.0.0.0");
+    let relay: SocketAddr =
+        format!("127.0.0.1:{}", u16::from_be_bytes([reply[8], reply[9]])).parse().unwrap();
+
+    let std::net::IpAddr::V4(ip) = echo.ip() else { panic!("tests use IPv4") };
+    let mut packet = vec![0x00, 0x00, 0x00, 0x01];
+    packet.extend_from_slice(&ip.octets());
+    packet.extend_from_slice(&echo.port().to_be_bytes());
+    packet.extend_from_slice(b"tick");
+
+    // Busy for 3s = 3× the idle timeout.
+    let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let mut buf = [0u8; 64];
+    for round in 0..10 {
+        udp.send_to(&packet, relay).await.unwrap();
+        tokio::time::timeout(Duration::from_millis(900), udp.recv_from(&mut buf))
+            .await
+            .unwrap_or_else(|_| panic!("active association was cut (round {round})"))
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+
+    // Quiet → the proxy ends the association by closing the control connection.
+    let closed = tokio::time::timeout(Duration::from_secs(4), ctrl.read(&mut buf)).await;
+    assert!(
+        matches!(closed, Ok(Ok(0)) | Ok(Err(_))),
+        "idle association was never closed, got {closed:?}"
+    );
+    cancel.cancel();
+}
+
+/// A5: shutting the tunnel *client* down must drain relays in flight on its
+/// sessions, not cut them.
+#[tokio::test]
+async fn client_shutdown_drains_in_flight_tunnel_relay() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let target = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut sock, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(800)).await;
+                let _ = sock.write_all(b"survived-client-shutdown").await;
+                let _ = sock.shutdown().await;
+            });
+        }
+    });
+
+    let (socks_port, tunnel_port) = two_free_ports().await;
+    let proxy: SocketAddr = format!("127.0.0.1:{socks_port}").parse().unwrap();
+    let server_cancel = CancellationToken::new();
+    let client_cancel = CancellationToken::new();
+    start_server(socks_port, tunnel_port, server_cancel.clone());
+    let client =
+        start_client_as("drain", SECRET, tunnel_port, 1, 256, 256, client_cancel.clone());
+
+    let mut conn = retry_connect(proxy, target).await;
+    client_cancel.cancel(); // the payload has not been sent yet
+
+    let got = tokio::time::timeout(Duration::from_secs(10), async {
+        let mut buf = Vec::new();
+        conn.read_to_end(&mut buf).await.unwrap();
+        buf
+    })
+    .await
+    .expect("relay did not finish after client shutdown");
+    assert_eq!(&got, b"survived-client-shutdown", "in-flight relay was cut");
+
+    // …and once drained, the client actually stops.
+    tokio::time::timeout(Duration::from_secs(10), client)
+        .await
+        .expect("client did not stop after draining")
+        .unwrap();
+    server_cancel.cancel();
+}
+
+/// A tunnel client that does not know the PSK must never become a route.
+#[tokio::test]
+async fn client_with_wrong_secret_is_not_registered() {
+    let echo = spawn_tcp_echo().await;
+    let (socks_port, tunnel_port) = two_free_ports().await;
+    let proxy: SocketAddr = format!("127.0.0.1:{socks_port}").parse().unwrap();
+    let cancel = CancellationToken::new();
+    start_server(socks_port, tunnel_port, cancel.clone());
+    start_client_as("intruder", "not-the-secret", tunnel_port, 2, 256, 256, cancel.clone());
+    wait_for_listener(proxy).await;
+
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    assert!(
+        socks5_connect(proxy, echo).await.is_err(),
+        "a client with the wrong PSK was accepted as a tunnel route"
+    );
+    cancel.cancel();
+}
+
+/// A6: with two tunnel clients registered, losing one must not lose service.
+#[tokio::test]
+async fn requests_fail_over_when_a_tunnel_client_goes_away() {
+    let echo = spawn_tcp_echo().await;
+    let (socks_port, tunnel_port) = two_free_ports().await;
+    let proxy: SocketAddr = format!("127.0.0.1:{socks_port}").parse().unwrap();
+    let cancel = CancellationToken::new();
+    let cancel_a = CancellationToken::new();
+    start_server(socks_port, tunnel_port, cancel.clone());
+    let client_a = start_client_as("client-a", SECRET, tunnel_port, 2, 256, 256, cancel_a.clone());
+    start_client_as("client-b", SECRET, tunnel_port, 2, 256, 256, cancel.clone());
+
+    drop(retry_connect(proxy, echo).await);
+    tokio::time::sleep(Duration::from_millis(500)).await; // let both register
+
+    cancel_a.cancel();
+    client_a.await.unwrap();
+
+    for i in 0..10 {
+        let mut s = socks5_connect(proxy, echo)
+            .await
+            .unwrap_or_else(|e| panic!("request {i} failed after client-a left: {e}"));
+        s.write_all(b"ok").await.unwrap();
+        let mut got = [0u8; 2];
+        s.read_exact(&mut got).await.unwrap();
+        assert_eq!(&got, b"ok");
+    }
+    cancel.cancel();
+}
+
+// ───────────────────────── slow / manual (run with --ignored) ─────────────────────────
+
+/// A7 safety net: the read watchdog (45s) must never kill a *healthy* idle
+/// session — the 10s heartbeat keeps ping/pong flowing. Idle for longer than
+/// the watchdog, then check the session was never re-established.
+///
+/// Slow (≈55s) and installs a global tracing subscriber, so it is `#[ignore]`d:
+/// `cargo test --test tunnel_e2e idle_tunnel -- --ignored`
+#[tokio::test]
+#[ignore]
+async fn idle_tunnel_session_survives_the_read_watchdog() {
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Default)]
+    struct Capture(Arc<Mutex<Vec<u8>>>);
+    impl std::io::Write for Capture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let logs = Capture::default();
+    let writer = logs.clone();
+    tracing_subscriber::fmt()
+        .with_env_filter("sox=debug")
+        .with_ansi(false)
+        .with_writer(move || writer.clone())
+        .init();
+
+    let echo = spawn_tcp_echo().await;
+    let (proxy, cancel) = spawn_tunnel(2, 256, 256).await;
+    drop(retry_connect(proxy, echo).await);
+
+    tokio::time::sleep(Duration::from_secs(55)).await;
+
+    let mut s = socks5_connect(proxy, echo).await.expect("idle tunnel stopped serving");
+    s.write_all(b"still-here").await.unwrap();
+    let mut got = [0u8; 10];
+    s.read_exact(&mut got).await.unwrap();
+
+    let text = String::from_utf8_lossy(&logs.0.lock().unwrap()).into_owned();
+    let established = text.matches("tunnel session established").count();
+    assert_eq!(established, 2, "sessions were re-established while idle:\n{text}");
+    assert!(!text.contains("read-idle"), "watchdog fired on a healthy session:\n{text}");
+    cancel.cancel();
+}
+
+/// Push `total` bytes through `proxy` to a sink and report throughput.
+async fn bench_upload(label: &str, proxy: SocketAddr, total: usize) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let sink = listener.local_addr().unwrap();
+    let received = tokio::spawn(async move {
+        let (mut sock, _) = listener.accept().await.unwrap();
+        let mut buf = vec![0u8; 256 * 1024];
+        let mut n = 0usize;
+        loop {
+            match sock.read(&mut buf).await.unwrap() {
+                0 => return n,
+                k => n += k,
+            }
+        }
+    });
+
+    let mut conn = retry_connect(proxy, sink).await;
+    let chunk = vec![0xA5u8; 256 * 1024];
+    let start = std::time::Instant::now();
+    let mut sent = 0;
+    while sent < total {
+        conn.write_all(&chunk).await.unwrap();
+        sent += chunk.len();
+    }
+    conn.shutdown().await.unwrap();
+    assert_eq!(received.await.unwrap(), sent);
+    let secs = start.elapsed().as_secs_f64();
+    println!(
+        "BENCH {label}: {:.0} MiB in {secs:.2}s = {:.0} MiB/s ({:.2} Gbps)",
+        sent as f64 / 1048576.0,
+        sent as f64 / 1048576.0 / secs,
+        sent as f64 * 8.0 / 1e9 / secs,
+    );
+}
+
+/// `cargo test --release --test tunnel_e2e bench_ -- --ignored --nocapture --test-threads=1`
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn bench_tunnel_upload() {
+    let (proxy, cancel) = spawn_tunnel(1, 256, 256).await;
+    for round in 0..3 {
+        bench_upload(&format!("tunnel round {round}"), proxy, 2 << 30).await;
+    }
+    cancel.cancel();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn bench_standalone_upload() {
+    let (proxy, cancel) = spawn_standalone(sox::config::Config::default()).await;
+    for round in 0..3 {
+        bench_upload(&format!("standalone round {round}"), proxy, 4 << 30).await;
+    }
     cancel.cancel();
 }

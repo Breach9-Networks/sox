@@ -1,12 +1,13 @@
 //! Routes incoming SOCKS requests to registered tunnel clients via yamux sessions.
 
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::time::Instant;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
-use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot};
+use tokio_util::sync::CancellationToken;
 
 /// 一個「開 outbound stream」的請求 —— session driver 開好後從 oneshot 回傳結果。
 pub type StreamRequest = oneshot::Sender<std::io::Result<yamux::Stream>>;
@@ -14,18 +15,36 @@ pub type StreamRequest = oneshot::Sender<std::io::Result<yamux::Stream>>;
 /// 全域遞增的 session id 產生器。
 static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
 
+/// 單次 `open_stream` 最多嘗試幾條 session。clients × sessions 很大時,
+/// 沒必要為了一條 flow 把全部 session 都試過一輪。
+const MAX_OPEN_ATTEMPTS: usize = 16;
+
+/// 單條 session 的嘗試時間下限 —— 總預算很小時也給每條 session 一點機會。
+const MIN_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(1);
+
 /// 對單一 yamux session driver 的控制把手。
 #[derive(Clone)]
 pub struct SessionHandle {
     pub id: u64,
+    /// client 端的 session slot(`Hello.session_index`)。同一 client 同一
+    /// slot 重連上來時,舊 session 必然已死,據此汰換。
+    index: u16,
     open_tx: mpsc::Sender<StreamRequest>,
+    /// 取消即結束該 session 的 driver。
+    cancel: CancellationToken,
 }
 
 impl SessionHandle {
-    pub fn new(open_tx: mpsc::Sender<StreamRequest>) -> Self {
+    pub fn new(
+        index: u16,
+        open_tx: mpsc::Sender<StreamRequest>,
+        cancel: CancellationToken,
+    ) -> Self {
         Self {
             id: NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed),
+            index,
             open_tx,
+            cancel,
         }
     }
 }
@@ -75,6 +94,15 @@ struct RegisteredClient {
     counters: Arc<ClientCounters>,
 }
 
+impl RegisteredClient {
+    /// 此 client 的 session,從 round-robin 游標的下一條開始排。
+    fn sessions_round_robin(&self) -> impl Iterator<Item = &SessionHandle> {
+        let n = self.sessions.len();
+        let start = self.next_session.fetch_add(1, Ordering::Relaxed);
+        (0..n).map(move |i| &self.sessions[(start + i) % n])
+    }
+}
+
 #[derive(Debug, Serialize, Clone)]
 pub struct ClientSnapshot {
     pub client_id: String,
@@ -87,11 +115,16 @@ pub struct ClientSnapshot {
     pub connected_secs: u64,
 }
 
+/// 鎖都是 `std::sync::Mutex`:臨界區內沒有任何 `.await`,持鎖時間是幾次
+/// HashMap 操作,比 async mutex 便宜,也讓 monitor 等同步呼叫端不必
+/// `block_on`。
 pub struct Router {
-    clients: Arc<Mutex<HashMap<String, RegisteredClient>>>,
+    clients: Mutex<HashMap<String, RegisteredClient>>,
     /// 永久存放每個 client_id 的 counters,給 RegisteredClient 共享 Arc 用。
     /// 跨重連續存的依據;remove_session 不需要 archive 任何資料。
-    counters: Arc<Mutex<HashMap<String, Arc<ClientCounters>>>>,
+    counters: Mutex<HashMap<String, Arc<ClientCounters>>>,
+    /// `open_stream(None)` 在 client 間輪替的游標。
+    next_client: AtomicUsize,
 }
 
 impl Default for Router {
@@ -103,28 +136,49 @@ impl Default for Router {
 impl Router {
     pub fn new() -> Self {
         Self {
-            clients: Arc::new(Mutex::new(HashMap::new())),
-            counters: Arc::new(Mutex::new(HashMap::new())),
+            clients: Mutex::new(HashMap::new()),
+            counters: Mutex::new(HashMap::new()),
+            next_client: AtomicUsize::new(0),
         }
     }
 
     /// 登記一條 session。同一 client 多次呼叫會累積 session；
     /// 第一條 session 到達時建立 client 並繼承既有(跨重連)的 counters。
-    pub async fn register_session(&self, client_id: String, handle: SessionHandle) {
+    ///
+    /// 同一 client 同一 `session_index` 已有 session 時,新的取代舊的:client
+    /// 每個 slot 只維持一條連線,它重連上來代表舊連線已死(多半是 server 端
+    /// 尚未察覺的半開連線)。舊 session 被取消並立刻移出 round-robin。
+    pub fn register_session(&self, client_id: String, handle: SessionHandle) {
         // 先取出/建立此 client 的 counters Arc(獨立鎖範圍,避免巢狀)。
-        let counters = {
-            let mut cs = self.counters.lock().await;
-            cs.entry(client_id.clone())
-                .or_insert_with(ClientCounters::new)
-                .clone()
-        };
+        let counters = self
+            .counters
+            .lock()
+            .unwrap()
+            .entry(client_id.clone())
+            .or_insert_with(ClientCounters::new)
+            .clone();
 
-        let mut clients = self.clients.lock().await;
+        let mut clients = self.clients.lock().unwrap();
         match clients.get_mut(&client_id) {
-            Some(client) => client.sessions.push(handle),
+            Some(client) => {
+                client.sessions.retain(|old| {
+                    if old.index != handle.index {
+                        return true;
+                    }
+                    tracing::info!(
+                        %client_id,
+                        session_index = old.index,
+                        "replacing stale tunnel session"
+                    );
+                    old.cancel.cancel();
+                    false
+                });
+                client.sessions.push(handle);
+            }
             None => {
+                tracing::info!(%client_id, "tunnel client registered");
                 clients.insert(
-                    client_id.clone(),
+                    client_id,
                     RegisteredClient {
                         sessions: vec![handle],
                         next_session: AtomicUsize::new(0),
@@ -132,7 +186,6 @@ impl Router {
                         counters,
                     },
                 );
-                tracing::info!(%client_id, "tunnel client registered");
             }
         }
     }
@@ -140,8 +193,8 @@ impl Router {
     /// 移除一條 session（session driver 結束時呼叫）。
     /// client 的最後一條 session 移除後,移除 RegisteredClient ——
     /// counters 仍在 `self.counters` 中,計數值跨重連續存。
-    pub async fn remove_session(&self, client_id: &str, session_id: u64) {
-        let mut clients = self.clients.lock().await;
+    pub fn remove_session(&self, client_id: &str, session_id: u64) {
+        let mut clients = self.clients.lock().unwrap();
         let Some(client) = clients.get_mut(client_id) else {
             return;
         };
@@ -152,36 +205,59 @@ impl Router {
         }
     }
 
-    /// 為一個 proxy flow 開一條 yamux stream。
-    ///
-    /// `client_id = None` 表示任挑一個有 session 的 client。在該 client 的
-    /// session 間 round-robin；任何一條 session 失敗（channel 關閉、driver
-    /// 未回覆、或開 stream 出錯如 session 已達 stream 上限）都跳下一條，
-    /// 直到試完全部 session 才放棄。
-    pub async fn open_stream(&self, client_id: Option<&str>) -> Option<TunnelStream> {
-        let (handles, counters) = {
-            let clients = self.clients.lock().await;
-            let client = match client_id {
-                Some(id) => clients.get(id)?,
-                None => clients.values().find(|c| !c.sessions.is_empty())?,
-            };
-            if client.sessions.is_empty() {
-                return None;
-            }
-            let n = client.sessions.len();
-            let start = client.next_session.fetch_add(1, Ordering::Relaxed);
-            let handles: Vec<SessionHandle> =
-                (0..n).map(|i| client.sessions[(start + i) % n].clone()).collect();
-            (handles, client.counters.clone())
+    /// 依嘗試順序列出候選 session。`client_id = None` 時涵蓋所有 client
+    /// (起點在 client 間輪替),單一 client 全掛時自動 failover 到其他 client。
+    fn candidates(&self, client_id: Option<&str>) -> Vec<(SessionHandle, Arc<ClientCounters>)> {
+        let clients = self.clients.lock().unwrap();
+        let of = |c: &RegisteredClient| {
+            c.sessions_round_robin()
+                .map(|h| (h.clone(), c.counters.clone()))
+                .collect::<Vec<_>>()
         };
-
-        for handle in handles {
-            let (reply_tx, reply_rx) = oneshot::channel();
-            if handle.open_tx.send(reply_tx).await.is_err() {
-                continue; // session 已死 —— 試下一條
+        match client_id {
+            Some(id) => clients.get(id).map(of).unwrap_or_default(),
+            None => {
+                let n = clients.len().max(1);
+                let start = self.next_client.fetch_add(1, Ordering::Relaxed) % n;
+                clients
+                    .values()
+                    .cycle()
+                    .skip(start)
+                    .take(clients.len())
+                    .flat_map(of)
+                    .take(MAX_OPEN_ATTEMPTS)
+                    .collect()
             }
-            match reply_rx.await {
-                Ok(Ok(stream)) => {
+        }
+    }
+
+    /// 為一個 proxy flow 開一條 yamux stream,整體不超過 `budget`。
+    ///
+    /// `client_id = None` 表示任一 client。任何一條 session 失敗（channel
+    /// 關閉、driver 未回覆、開 stream 出錯如已達 stream 上限、或逾時 ——
+    /// session 卡住時 `send`/reply 都可能永遠等不到）都跳下一條,直到試完
+    /// 候選或預算用盡才放棄。
+    pub async fn open_stream(
+        &self,
+        client_id: Option<&str>,
+        budget: Duration,
+    ) -> Option<TunnelStream> {
+        let deadline = tokio::time::Instant::now() + budget;
+        let per_attempt = (budget / 3).max(MIN_ATTEMPT_TIMEOUT);
+
+        for (handle, counters) in self.candidates(client_id).into_iter().take(MAX_OPEN_ATTEMPTS) {
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                break;
+            }
+            let attempt = async {
+                let (reply_tx, reply_rx) = oneshot::channel();
+                handle.open_tx.send(reply_tx).await.ok()?; // Err = session 已死
+                reply_rx.await.ok()?.ok() // Err = driver 已結束 / 開 stream 失敗
+            };
+            let attempt_deadline = (now + per_attempt).min(deadline);
+            match tokio::time::timeout_at(attempt_deadline, attempt).await {
+                Ok(Some(stream)) => {
                     // 真正開到 stream 才算一次「已服務」請求。counters Arc
                     // 共享於 self.counters,fetch_add 永遠落在最終的持久
                     // store 上,不會因為 remove_session 而漏算 —— 這就是
@@ -193,24 +269,26 @@ impl Router {
                         rx_bytes: counters.rx_bytes.clone(),
                     });
                 }
-                Ok(Err(_)) => continue, // 這條 session 開 stream 失敗 —— 試下一條
-                Err(_) => continue,     // driver 未回覆即結束 —— session 已死
+                Ok(None) => {}
+                Err(_) => {
+                    tracing::debug!(session = handle.id, "tunnel session did not open a stream in time");
+                }
             }
         }
         None
     }
 
     /// 累加某 client 的流量計數（測試與外部統計用）。
-    pub async fn record_traffic(&self, client_id: &str, tx: u64, rx: u64) {
-        let clients = self.clients.lock().await;
+    pub fn record_traffic(&self, client_id: &str, tx: u64, rx: u64) {
+        let clients = self.clients.lock().unwrap();
         if let Some(client) = clients.get(client_id) {
             client.counters.tx_bytes.fetch_add(tx, Ordering::Relaxed);
             client.counters.rx_bytes.fetch_add(rx, Ordering::Relaxed);
         }
     }
 
-    pub async fn client_snapshots(&self) -> Vec<ClientSnapshot> {
-        let clients = self.clients.lock().await;
+    pub fn client_snapshots(&self) -> Vec<ClientSnapshot> {
+        let clients = self.clients.lock().unwrap();
         clients
             .iter()
             .map(|(id, c)| ClientSnapshot {
@@ -225,21 +303,27 @@ impl Router {
             .collect()
     }
 
-    pub async fn client_ids(&self) -> Vec<String> {
-        let clients = self.clients.lock().await;
-        clients.keys().cloned().collect()
+    pub fn client_ids(&self) -> Vec<String> {
+        self.clients.lock().unwrap().keys().cloned().collect()
     }
 
-    pub async fn has_clients(&self) -> bool {
-        let clients = self.clients.lock().await;
-        !clients.is_empty()
+    pub fn has_clients(&self) -> bool {
+        !self.clients.lock().unwrap().is_empty()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::{AtomicU16, AtomicUsize};
+
+    const BUDGET: Duration = Duration::from_secs(5);
+
+    /// Distinct session slots, so fake sessions don't replace one another.
+    fn next_index() -> u16 {
+        static NEXT: AtomicU16 = AtomicU16::new(0);
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    }
 
     /// spawn 一個假的 session driver：收到開 stream 請求就計數並回 Err。
     fn fake_session(counter: Arc<AtomicUsize>) -> SessionHandle {
@@ -250,7 +334,7 @@ mod tests {
                 let _ = reply.send(Err(std::io::Error::other("fake")));
             }
         });
-        SessionHandle::new(tx)
+        SessionHandle::new(next_index(), tx, CancellationToken::new())
     }
 
     #[tokio::test]
@@ -262,12 +346,11 @@ mod tests {
             (0..3).map(|_| Arc::new(AtomicUsize::new(0))).collect();
         for c in &counters {
             router
-                .register_session("c1".into(), fake_session(c.clone()))
-                .await;
+                .register_session("c1".into(), fake_session(c.clone()));
         }
         // Every fake session errors, so each call must exhaust all three.
         for _ in 0..2 {
-            assert!(router.open_stream(Some("c1")).await.is_none());
+            assert!(router.open_stream(Some("c1"), BUDGET).await.is_none());
         }
         for c in &counters {
             assert_eq!(
@@ -282,12 +365,10 @@ mod tests {
     async fn requests_served_counts_only_successful_opens() {
         // B8: a failed open_stream must not inflate requests_served.
         let router = Router::new();
-        router
-            .register_session("c1".into(), fake_session(Arc::new(AtomicUsize::new(0))))
-            .await;
+        router.register_session("c1".into(), fake_session(Arc::new(AtomicUsize::new(0))));
         // The fake session always errors → open_stream returns None.
-        assert!(router.open_stream(Some("c1")).await.is_none());
-        let snaps = router.client_snapshots().await;
+        assert!(router.open_stream(Some("c1"), BUDGET).await.is_none());
+        let snaps = router.client_snapshots();
         assert_eq!(
             snaps[0].requests_served, 0,
             "failed routing attempts must not count as served requests",
@@ -300,14 +381,14 @@ mod tests {
         let h1 = fake_session(Arc::new(AtomicUsize::new(0)));
         let h2 = fake_session(Arc::new(AtomicUsize::new(0)));
         let (id1, id2) = (h1.id, h2.id);
-        router.register_session("c1".into(), h1).await;
-        router.register_session("c1".into(), h2).await;
+        router.register_session("c1".into(), h1);
+        router.register_session("c1".into(), h2);
 
-        router.remove_session("c1", id1).await;
-        assert!(router.has_clients().await, "client stays while a session remains");
+        router.remove_session("c1", id1);
+        assert!(router.has_clients(), "client stays while a session remains");
 
-        router.remove_session("c1", id2).await;
-        assert!(!router.has_clients().await, "client gone after last session");
+        router.remove_session("c1", id2);
+        assert!(!router.has_clients(), "client gone after last session");
     }
 
     #[tokio::test]
@@ -315,16 +396,16 @@ mod tests {
         let router = Router::new();
         let h = fake_session(Arc::new(AtomicUsize::new(0)));
         let id = h.id;
-        router.register_session("c1".into(), h).await;
-        router.record_traffic("c1", 1000, 2000).await;
+        router.register_session("c1".into(), h);
+        router.record_traffic("c1", 1000, 2000);
 
         // 全部 session 移除 → 累計計數存檔。
-        router.remove_session("c1", id).await;
+        router.remove_session("c1", id);
 
         // 重新登記 → 計數應還原。
         let h = fake_session(Arc::new(AtomicUsize::new(0)));
-        router.register_session("c1".into(), h).await;
-        let snaps = router.client_snapshots().await;
+        router.register_session("c1".into(), h);
+        let snaps = router.client_snapshots();
         assert_eq!(snaps[0].tx_bytes, 1000);
         assert_eq!(snaps[0].rx_bytes, 2000);
     }
@@ -349,14 +430,14 @@ mod tests {
             // reconnect" path to validate counter persistence.
             while rx.recv().await.is_some() {}
         });
-        let h = SessionHandle::new(tx);
+        let h = SessionHandle::new(next_index(), tx, CancellationToken::new());
         let id = h.id;
-        router.register_session("c2".into(), h).await;
+        router.register_session("c2".into(), h);
 
         // Bump requests_served directly via the same Arc the open_stream
         // path would use; this is what the refactor guarantees survives.
         {
-            let clients = router.clients.lock().await;
+            let clients = router.clients.lock().unwrap();
             clients
                 .get("c2")
                 .unwrap()
@@ -365,14 +446,59 @@ mod tests {
                 .fetch_add(7, Ordering::Relaxed);
         }
 
-        router.remove_session("c2", id).await;
-        assert!(!router.has_clients().await);
+        router.remove_session("c2", id);
+        assert!(!router.has_clients());
 
         // Reconnect — counters Arc lives on in router.counters and is
         // re-bound to the new RegisteredClient.
         let h = fake_session(Arc::new(AtomicUsize::new(0)));
-        router.register_session("c2".into(), h).await;
-        let snaps = router.client_snapshots().await;
+        router.register_session("c2".into(), h);
+        let snaps = router.client_snapshots();
         assert_eq!(snaps[0].requests_served, 7, "requests_served must persist");
+    }
+
+    #[tokio::test]
+    async fn reconnect_on_same_slot_replaces_and_cancels_stale_session() {
+        let router = Router::new();
+        let (tx_old, _rx_old) = mpsc::channel::<StreamRequest>(1);
+        let old_cancel = CancellationToken::new();
+        router.register_session("c1".into(), SessionHandle::new(900, tx_old, old_cancel.clone()));
+
+        let (tx_new, _rx_new) = mpsc::channel::<StreamRequest>(1);
+        let new_cancel = CancellationToken::new();
+        router.register_session("c1".into(), SessionHandle::new(900, tx_new, new_cancel.clone()));
+
+        assert!(old_cancel.is_cancelled(), "stale session must be cancelled");
+        assert!(!new_cancel.is_cancelled());
+        assert_eq!(router.client_snapshots()[0].sessions, 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn open_stream_times_out_on_a_wedged_session() {
+        // A6: a session whose driver never answers must not hang the caller.
+        let router = Router::new();
+        let (tx, _rx_never_polled) = mpsc::channel::<StreamRequest>(1);
+        router.register_session("c1".into(), SessionHandle::new(901, tx, CancellationToken::new()));
+        let got = tokio::time::timeout(
+            Duration::from_secs(60),
+            router.open_stream(None, Duration::from_secs(10)),
+        )
+        .await
+        .expect("open_stream hung on a wedged session");
+        assert!(got.is_none());
+    }
+
+    #[tokio::test]
+    async fn open_stream_fails_over_to_another_client() {
+        // `None` must consider every client, not just the first in the map.
+        let router = Router::new();
+        let hits: Vec<Arc<AtomicUsize>> = (0..3).map(|_| Arc::new(AtomicUsize::new(0))).collect();
+        for (i, c) in hits.iter().enumerate() {
+            router.register_session(format!("client-{i}"), fake_session(c.clone()));
+        }
+        assert!(router.open_stream(None, BUDGET).await.is_none());
+        for c in &hits {
+            assert_eq!(c.load(Ordering::Relaxed), 1, "every client should have been tried");
+        }
     }
 }

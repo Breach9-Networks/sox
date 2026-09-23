@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::Instant;
@@ -20,14 +19,14 @@ pub struct ExtendedMetrics {
     // Uptime
     pub start_time: Instant,
 
-    // Rate tracking
-    rate_tracker: Mutex<RateTracker>,
+    // Connection rate, in milli-connections/sec, derived by the periodic
+    // sampler from the `total_connections` counter — the accept path itself
+    // takes no lock for it.
+    conn_rate_milli: AtomicU64,
+    prev_total_conns: AtomicU64,
 
     // Traffic history (ring buffer for chart)
     traffic_history: Mutex<TrafficHistory>,
-
-    // Per-IP tracking
-    ip_tracker: Mutex<IpTracker>,
 
     // Authenticated user tracking
     active_users: Mutex<HashMap<String, u64>>,
@@ -52,10 +51,10 @@ impl ExtendedMetrics {
             errors_auth_rejected: AtomicU64::new(0),
             errors_relay: AtomicU64::new(0),
             start_time: Instant::now(),
-            rate_tracker: Mutex::new(RateTracker::new()),
+            conn_rate_milli: AtomicU64::new(0),
+            prev_total_conns: AtomicU64::new(0),
             traffic_history: Mutex::new(TrafficHistory::new(720)),
             active_users: Mutex::new(HashMap::new()),
-            ip_tracker: Mutex::new(IpTracker::new()),
             prev_tx: AtomicU64::new(0),
             prev_rx: AtomicU64::new(0),
         }
@@ -66,19 +65,19 @@ impl ExtendedMetrics {
         self.peak_connections.fetch_max(current, Ordering::Relaxed);
     }
 
-    /// Record a new connection for rate tracking.
-    pub fn record_connection(&self) {
-        if let Ok(mut rt) = self.rate_tracker.lock() {
-            rt.record();
-        }
+    /// Update the connection rate from the cumulative connection count
+    /// (called periodically by the background sampler).
+    pub fn sample_connection_rate(&self, total_connections: u64, interval: std::time::Duration) {
+        let prev = self.prev_total_conns.swap(total_connections, Ordering::Relaxed);
+        let delta = total_connections.saturating_sub(prev);
+        let millis = interval.as_millis().max(1) as u64;
+        self.conn_rate_milli
+            .store(delta.saturating_mul(1_000_000) / millis, Ordering::Relaxed);
     }
 
-    /// Get connections per second.
+    /// Get connections per second (over the last sampling interval).
     pub fn connections_per_sec(&self) -> f64 {
-        self.rate_tracker
-            .lock()
-            .map(|rt| rt.rate())
-            .unwrap_or(0.0)
+        self.conn_rate_milli.load(Ordering::Relaxed) as f64 / 1000.0
     }
 
     /// Record a traffic sample (called periodically by background task).
@@ -102,26 +101,16 @@ impl ExtendedMetrics {
             .unwrap_or_default()
     }
 
-    /// Record a connection from an IP.
-    pub fn record_ip_connect(&self, ip: IpAddr) {
-        if let Ok(mut it) = self.ip_tracker.lock() {
-            it.connect(ip);
+    /// Track an authenticated user's connection for as long as the returned
+    /// guard lives — so the active-user count covers the whole session, not
+    /// just the instant it ends.
+    #[must_use]
+    pub fn user_session(&self, username: &str) -> UserSessionGuard<'_> {
+        self.record_user_connect(username);
+        UserSessionGuard {
+            metrics: self,
+            username: username.to_string(),
         }
-    }
-
-    /// Record a disconnection from an IP.
-    pub fn record_ip_disconnect(&self, ip: IpAddr) {
-        if let Ok(mut it) = self.ip_tracker.lock() {
-            it.disconnect(ip);
-        }
-    }
-
-    /// Get top N IPs by active connection count.
-    pub fn top_ips(&self, n: usize) -> Vec<IpCount> {
-        self.ip_tracker
-            .lock()
-            .map(|it| it.top(n))
-            .unwrap_or_default()
     }
 
     /// Record an authenticated user connection.
@@ -159,48 +148,15 @@ impl ExtendedMetrics {
     }
 }
 
-// ── Rate Tracker ──
-
-struct RateTracker {
-    timestamps: std::collections::VecDeque<Instant>,
-    window: std::time::Duration,
+/// Removes the user's connection from the active set on drop.
+pub struct UserSessionGuard<'a> {
+    metrics: &'a ExtendedMetrics,
+    username: String,
 }
 
-impl RateTracker {
-    fn new() -> Self {
-        Self {
-            timestamps: std::collections::VecDeque::new(),
-            window: std::time::Duration::from_secs(10),
-        }
-    }
-
-    fn record(&mut self) {
-        let now = Instant::now();
-        self.timestamps.push_back(now);
-        self.cleanup(now);
-    }
-
-    fn rate(&self) -> f64 {
-        if self.timestamps.is_empty() {
-            return 0.0;
-        }
-        let now = Instant::now();
-        let count = self
-            .timestamps
-            .iter()
-            .filter(|t| now.duration_since(**t) < self.window)
-            .count();
-        count as f64 / self.window.as_secs_f64()
-    }
-
-    fn cleanup(&mut self, now: Instant) {
-        while let Some(front) = self.timestamps.front() {
-            if now.duration_since(*front) > self.window {
-                self.timestamps.pop_front();
-            } else {
-                break;
-            }
-        }
+impl Drop for UserSessionGuard<'_> {
+    fn drop(&mut self) {
+        self.metrics.record_user_disconnect(&self.username);
     }
 }
 
@@ -270,46 +226,7 @@ pub struct TrafficHistorySnapshot {
     pub rx: Vec<u64>,
 }
 
-// ── IP Tracker ──
-
-struct IpTracker {
-    counts: HashMap<IpAddr, u64>,
-}
-
-impl IpTracker {
-    fn new() -> Self {
-        Self {
-            counts: HashMap::new(),
-        }
-    }
-
-    fn connect(&mut self, ip: IpAddr) {
-        *self.counts.entry(ip).or_insert(0) += 1;
-    }
-
-    fn disconnect(&mut self, ip: IpAddr) {
-        if let Some(count) = self.counts.get_mut(&ip) {
-            *count = count.saturating_sub(1);
-            if *count == 0 {
-                self.counts.remove(&ip);
-            }
-        }
-    }
-
-    fn top(&self, n: usize) -> Vec<IpCount> {
-        let mut sorted: Vec<_> = self
-            .counts
-            .iter()
-            .map(|(ip, count)| IpCount {
-                ip: ip.to_string(),
-                connections: *count,
-            })
-            .collect();
-        sorted.sort_by(|a, b| b.connections.cmp(&a.connections));
-        sorted.truncate(n);
-        sorted
-    }
-}
+// ── Per-IP counts (produced by `PerIpLimiter::top`) ──
 
 #[derive(Debug, Serialize)]
 pub struct IpCount {
@@ -320,7 +237,6 @@ pub struct IpCount {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::{IpAddr, Ipv4Addr};
 
     #[test]
     fn test_peak_connections() {
@@ -384,41 +300,24 @@ mod tests {
     }
 
     #[test]
-    fn test_rate_tracker() {
-        let mut rt = RateTracker::new();
-        for _ in 0..5 {
-            rt.record();
-        }
-        let rate = rt.rate();
-        assert!(rate > 0.0, "rate should be positive after recording connections");
+    fn test_connection_rate_sampling() {
+        let m = ExtendedMetrics::new();
+        assert_eq!(m.connections_per_sec(), 0.0);
+        m.sample_connection_rate(50, std::time::Duration::from_secs(5));
+        assert_eq!(m.connections_per_sec(), 10.0);
+        // No new connections in the next interval → rate drops to zero.
+        m.sample_connection_rate(50, std::time::Duration::from_secs(5));
+        assert_eq!(m.connections_per_sec(), 0.0);
     }
 
     #[test]
-    fn test_ip_tracker() {
-        let mut it = IpTracker::new();
-        let ip_a: IpAddr = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
-        let ip_b: IpAddr = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2));
-
-        it.connect(ip_a);
-        it.connect(ip_a);
-        it.connect(ip_a);
-        it.connect(ip_b);
-
-        let top = it.top(10);
-        assert_eq!(top.len(), 2);
-        assert_eq!(top[0].ip, "10.0.0.1");
-        assert_eq!(top[0].connections, 3);
-        assert_eq!(top[1].ip, "10.0.0.2");
-        assert_eq!(top[1].connections, 1);
-
-        it.disconnect(ip_a);
-        let top = it.top(10);
-        assert_eq!(top[0].connections, 2);
-
-        // Disconnect all of ip_b — should be removed
-        it.disconnect(ip_b);
-        let top = it.top(10);
-        assert_eq!(top.len(), 1);
+    fn test_user_session_guard_covers_the_session() {
+        let m = ExtendedMetrics::new();
+        {
+            let _alice = m.user_session("alice");
+            assert_eq!(m.active_user_count(), 1, "user must count as active during the session");
+        }
+        assert_eq!(m.active_user_count(), 0);
     }
 
     #[test]

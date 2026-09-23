@@ -2,6 +2,7 @@ pub mod auth;
 pub mod client;
 pub mod config;
 pub mod error;
+pub mod net;
 pub mod protocol;
 pub mod relay;
 pub mod server;

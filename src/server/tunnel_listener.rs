@@ -11,7 +11,7 @@ use tokio::sync::{Semaphore, mpsc};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
-use crate::tunnel::apply_tunnel_keepalive;
+use crate::tunnel::configure_tunnel_socket;
 use crate::tunnel::noise::{NoiseStream, derive_psk};
 use crate::tunnel::protocol::{Hello, HelloAck, PROTO_VERSION};
 use crate::tunnel::router::{Router, SessionHandle};
@@ -27,6 +27,9 @@ const OPEN_REQUEST_BUFFER: usize = 64;
 /// completes the TCP connection but stalls mid-handshake must not hold a
 /// tunnel-connection slot indefinitely.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Pause after a failed `accept()` so fd exhaustion does not become a busy loop.
+const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
 
 pub async fn run_tunnel_listener(
     listen_addr: &str,
@@ -55,11 +58,26 @@ pub async fn run_tunnel_listener(
                 tracing::info!("tunnel listener shutting down");
                 break;
             }
+            // Reap finished sessions so the JoinSet does not grow without bound.
+            Some(_) = tasks.join_next(), if !tasks.is_empty() => {}
             result = listener.accept() => {
-                let (stream, peer_addr) = result?;
-                stream.set_nodelay(true)?;
-                // Half-open dead-connection detection — OS-level TCP keepalive.
-                let _ = apply_tunnel_keepalive(&stream);
+                let (stream, peer_addr) = match result {
+                    Ok(pair) => pair,
+                    Err(e) => {
+                        // A failed accept (EMFILE, ECONNABORTED, …) must not end
+                        // the listener: returning here would drop the JoinSet,
+                        // abort every tunnel session and leave clients unable
+                        // to re-register. Back off briefly and keep accepting.
+                        tracing::warn!(error = %e, "tunnel accept failed, backing off");
+                        tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
+                        continue;
+                    }
+                };
+                // NODELAY + half-open detection. A failure here concerns this
+                // one socket (e.g. the peer already reset it) — never fatal.
+                if let Err(e) = configure_tunnel_socket(&stream) {
+                    tracing::debug!(%peer_addr, error = %e, "tunnel socket setup failed");
+                }
 
                 let permit = match semaphore.clone().try_acquire_owned() {
                     Ok(p) => p,
@@ -85,7 +103,19 @@ pub async fn run_tunnel_listener(
         }
     }
 
-    tasks.abort_all();
+    // Every session holds a child of `cancel`: each is now sending GoAway and
+    // closing (bounded by CLOSE_TIMEOUT). Give them that long, then abort.
+    let close_deadline = tokio::time::sleep(crate::tunnel::CLOSE_TIMEOUT + Duration::from_secs(1));
+    tokio::pin!(close_deadline);
+    while !tasks.is_empty() {
+        tokio::select! {
+            _ = tasks.join_next() => {}
+            _ = &mut close_deadline => {
+                tasks.abort_all();
+                break;
+            }
+        }
+    }
     Ok(())
 }
 
@@ -151,14 +181,17 @@ async fn handle_tunnel_conn(
     tracing::info!(%client_id, session_index = hello.session_index, "tunnel session accepted");
 
     // Register a SessionHandle and drive the yamux session to completion.
+    // The session gets its own child token so the router can end just this
+    // session when the same client slot reconnects (stale half-open session).
     let byte_stream = noise.into_byte_stream();
     let (open_tx, open_rx) = mpsc::channel(OPEN_REQUEST_BUFFER);
-    let handle = SessionHandle::new(open_tx);
+    let session_cancel = cancel.child_token();
+    let handle = SessionHandle::new(hello.session_index, open_tx, session_cancel.clone());
     let session_id = handle.id;
-    router.register_session(client_id.clone(), handle).await;
+    router.register_session(client_id.clone(), handle);
 
-    server_session_driver(byte_stream, open_rx, max_streams, recv_window_mb, cancel).await;
+    server_session_driver(byte_stream, open_rx, max_streams, recv_window_mb, session_cancel).await;
 
-    router.remove_session(&client_id, session_id).await;
+    router.remove_session(&client_id, session_id);
     Ok(())
 }

@@ -74,9 +74,9 @@ impl Default for Config {
             dns_timeout: Duration::from_secs(5),
             idle_timeout: Duration::from_secs(300),
             drain_timeout: Duration::from_secs(30),
-            tcp_keepalive_idle: Duration::from_secs(30),
-            tcp_keepalive_interval: Duration::from_secs(10),
-            tcp_keepalive_probes: 3,
+            tcp_keepalive_idle: crate::net::KeepaliveParams::PROXY_DEFAULT.idle,
+            tcp_keepalive_interval: crate::net::KeepaliveParams::PROXY_DEFAULT.interval,
+            tcp_keepalive_probes: crate::net::KeepaliveParams::PROXY_DEFAULT.probes,
             monitor_addr: None,
             tunnel_max_streams: 256,
             // See `src/tunnel/session.rs::yamux_config` for why this must stay
@@ -84,6 +84,17 @@ impl Default for Config {
             // zero headroom for yamux per-stream BDP auto-tuning, capping
             // single-stream throughput at ~256 KiB / RTT.
             tunnel_recv_window_mb: 256,
+        }
+    }
+}
+
+impl Config {
+    /// Keepalive parameters for proxied sockets (SOCKS clients and targets).
+    pub fn keepalive(&self) -> crate::net::KeepaliveParams {
+        crate::net::KeepaliveParams {
+            idle: self.tcp_keepalive_idle,
+            interval: self.tcp_keepalive_interval,
+            probes: self.tcp_keepalive_probes,
         }
     }
 }
@@ -151,11 +162,16 @@ impl FileConfig {
     }
 
     /// Apply file config values onto a Config, overriding only what's set.
-    pub fn apply_to(&self, config: &mut Config) {
-        if let Some(ref listen) = self.listen
-            && let Ok(addr) = listen.parse() {
-                config.listen_addr = addr;
-            }
+    ///
+    /// An unparsable value is an error, not something to skip silently — a
+    /// proxy quietly listening on the default address instead of the
+    /// configured one is a misconfiguration nobody notices.
+    pub fn apply_to(&self, config: &mut Config) -> Result<(), String> {
+        if let Some(ref listen) = self.listen {
+            config.listen_addr = listen
+                .parse()
+                .map_err(|e| format!("config: invalid listen address '{listen}': {e}"))?;
+        }
         if let Some(v) = self.max_connections {
             config.max_connections = v;
         }
@@ -220,5 +236,27 @@ impl FileConfig {
                 config.tunnel_recv_window_mb = v;
             }
         }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn file_values_apply_and_bad_listen_is_an_error() {
+        let fc: FileConfig = toml::from_str(
+            "listen = \"0.0.0.0:2080\"\nmax_connections = 7\nidle_timeout = 42\n",
+        )
+        .unwrap();
+        let mut config = Config::default();
+        fc.apply_to(&mut config).unwrap();
+        assert_eq!(config.listen_addr, "0.0.0.0:2080".parse().unwrap());
+        assert_eq!(config.max_connections, 7);
+        assert_eq!(config.idle_timeout, Duration::from_secs(42));
+
+        let bad: FileConfig = toml::from_str("listen = \"not-an-address\"\n").unwrap();
+        assert!(bad.apply_to(&mut Config::default()).is_err());
     }
 }
