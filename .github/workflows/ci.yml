@@ -1,0 +1,85 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# A newer push to the same branch/PR supersedes the running job.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Fail on warnings everywhere, so clippy/rustc drift shows up in CI, not in review.
+  RUSTFLAGS: -D warnings
+
+jobs:
+  # Unit + e2e tests on every platform the binary ships for. The e2e suite
+  # stands up real servers/clients over loopback (TCP + UDP), which is what
+  # exercises the cfg-gated socket code (TCP_KEEPCNT, Windows peek/signals).
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --all-targets
+      # Doc tests are not covered by --all-targets.
+      - run: cargo test --doc
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --all-targets -- -D warnings
+
+  # musl has no runner, so cross-compile: a `cargo check` of every target
+  # catches cfg mistakes, and a release build proves the release profile
+  # (LTO, per-package opt-levels) links on the static target we ship.
+  musl:
+    name: linux-musl (check + release build)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update -q && sudo apt-get install -y -q musl-tools
+      - run: cargo check --all-targets --target x86_64-unknown-linux-musl
+      - run: cargo build --release --target x86_64-unknown-linux-musl
+      - name: verify the binary is static
+        run: |
+          file target/x86_64-unknown-linux-musl/release/sox
+          ldd target/x86_64-unknown-linux-musl/release/sox 2>&1 | grep -qi "not a dynamic executable\|statically linked"
+
+  # Release profile on the other two platforms — LTO + panic=unwind + the
+  # per-package opt-level overrides must build wherever the binary ships.
+  release-build:
+    name: release build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release
