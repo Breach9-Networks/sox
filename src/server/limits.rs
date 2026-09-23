@@ -49,7 +49,7 @@ impl PerIpLimiter {
                 connections: *count as u64,
             })
             .collect();
-        top.sort_by(|a, b| b.connections.cmp(&a.connections));
+        top.sort_by_key(|c| std::cmp::Reverse(c.connections));
         top.truncate(n);
         top
     }
