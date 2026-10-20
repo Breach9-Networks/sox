@@ -66,6 +66,12 @@ pub async fn run_standalone(
         }
     };
 
+    if let Some(upstream) = &config.upstream {
+        tracing::info!(
+            %upstream, udp = %config.upstream_udp, sni = config.upstream_sni,
+            "forwarding CONNECT via upstream HTTP proxy"
+        );
+    }
     tracing::info!("SOCKS proxy listening on {}", config.listen_addr);
 
     let limiter = Arc::new(Semaphore::new(config.max_connections));

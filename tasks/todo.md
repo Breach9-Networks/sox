@@ -1,3 +1,49 @@
+# sox — upstream HTTP proxy(2026-10-19)
+
+用途:手機只能設 SOCKS → `sox standalone --upstream http://127.0.0.1:8080` → Burp。
+
+- [x] U1 `src/upstream.rs`:`HttpUpstream::parse`(`[http://]host:port`,拒絕 https/socks/userinfo)
+- [x] U2 `HttpUpstream::connect`:解析 + `connect_any` + keepalive,送 `CONNECT`(domain 原樣轉送、IPv6 加 `[]`),
+      精確讀到 `\r\n\r\n` 不多吃 tunnel 資料,全程共用 `connect_timeout` deadline
+- [x] U3 HTTP status → SOCKS5 ReplyCode 對應(`error.rs::upstream_status_reply_code`)
+- [x] U4 `Config.upstream` + TOML `upstream` + standalone `--upstream`(CLI > TOML > 無);server 模式設了就報錯
+- [x] U5 `connection.rs::dial()` 分流;設 upstream 時 UDP ASSOCIATE 回 CommandNotSupported
+- [x] U6 測試:parse、CONNECT 成功/非 2xx/header 後緊接資料不遺失、端對端 SOCKS5 → 假 HTTP proxy
+- [x] U7 README / config.example.toml;`cargo test`、`cargo clippy -D warnings`、curl → sox → 真 Burp 驗證
+- [ ] U8 實機:PCAPdroid → sox → Burp
+- [x] U9 `--upstream-sni`(IP-only CONNECT 以 ClientHello SNI 命名)、`[upstream] udp = reject|direct`
+
+### Code review(2026-10-20,15 項)→ 修正
+- [x] R1 設了帳密時拒絕 SOCKS4/4a(協定無密碼,原本直接放行)
+- [x] R2 tunnel 模式 SOCKS4 CONNECT 走 router(原本從 server 本機直連 → SSRF);SOCKS4/5 CONNECT 合併成一條路徑
+- [x] R3 SNI 命名後 upstream 回「unreachable」類(404/410/502/503)→ 改 CONNECT 原 IP
+- [x] R4 ClientHello 首次讀取給 4 KiB(避免 8 bytes 首包被拆);client 等待中斷線不再撥 upstream
+- [x] R5 IP literal 以 domain 送來:解析時(`TargetAddr::from_host`)就轉成 `Ip`,IPv6 自然加 `[]`
+- [x] R6 `--upstream-sni` 改 `Option<bool>`(CLI 可關掉 TOML 的 `sni = true`)
+- [x] R7 upstream 撥號共用單一 deadline;proxy 本身連不上 → GeneralFailure(不歸咎 target),warn 一次/恢復 info 一次
+- [x] R8 `sox client` 也拒絕 `[upstream]`
+- [x] R9 SNI 允許 `_`、上限 255;parse 錯誤訊息不回顯帳密、scheme 不分大小寫
+- [x] R10 upstream 回應容忍 bare LF 與非 UTF-8 reason phrase
+- [x] R11 e2e:UDP reject 檢查 0x07、SNI 測試加 timeout;SOCKS4 帳密 / tunnel SOCKS4 測試
+- 延後:upstream 位址快取(Windows `localhost` 每連線 ~2s 的 ::1 嘗試)—— 需在 `HttpUpstream` 放共享狀態,另開
+- 延後:SNI 等待與 upstream 撥號並行;server-speaks-first(SSH/SMTP)每條連線付 `SNI_WAIT` 2s
+
+### /simplify(4 agents)→ 採用
+- TLS record reader 搬回 `protocol/tls.rs`,常數/`handshake_record_len` 改回 private
+- `net::read_field`:SOCKS4 NUL 欄位與 upstream response head 共用 peek-then-consume
+- `addr::is_valid_hostname`:SNI 與 SOCKS domain → CONNECT 同一套規則
+- `TransitionLog`:tunnel「無 client」與 upstream 健康 log 共用(先 load 再 swap)
+- `ServerError::is_upstream_fault` 與 status 對應放一起;`UpstreamUdp` 改 `clap::ValueEnum`
+- UDP ASSOCIATE 成功回覆走 `Dialect::V5.success`;e2e helper 合併(`socks5_request`/`next_request`/`read_echo`)
+- 略過:Config 巢狀 `Option<Upstream{..}>`(CLI/TOML 逐欄合併較直接)、三處 dial 合併成 `net::dial`(超出本次範圍)
+
+### Review
+- 新模組 `src/upstream.rs`;`dial()` 一個分支,SOCKS4/4a/5 CONNECT 全部適用。
+- CONNECT 回應讀取用 peek 精確停在 `\r\n\r\n`,不吃掉 tunnel 首包(有測試)。
+- SOCKS domain 含控制字元/空白即拒絕,避免對 upstream 的 header injection。
+- 本機 CLT SDK 27 的 tbd 讓 ld-1267 連結失敗(`arm64e.x1`),暫用 `SDKROOT=.../MacOSX26.5.sdk`。
+- 修正後 127 tests(+3 ignored)、clippy `-D warnings` 乾淨;windows-gnu / linux-musl `cargo check --all-targets` 通過。
+
 # sox — Round 3 優化(2026-09-22 全碼審查 → 全數修復)
 
 來源:完整讀碼審查(熱路徑人工 + 3 個 subagent)。「已核對」= 主 agent 對過程式碼;

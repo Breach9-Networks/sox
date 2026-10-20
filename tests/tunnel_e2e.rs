@@ -965,3 +965,295 @@ async fn bench_standalone_upload() {
     }
     cancel.cancel();
 }
+
+// ───────────────────────── upstream HTTP proxy ─────────────────────────
+
+/// A fake HTTP proxy: reports each request line it gets on the channel,
+/// answers with `status`, and on success echoes the tunnel itself — standing
+/// in for both the proxy and the target. The `200` reply and the first echoed
+/// bytes never share a write.
+async fn spawn_http_proxy(status: u16) -> (SocketAddr, tokio::sync::mpsc::UnboundedReceiver<String>) {
+    spawn_http_proxy_with(move |_| status).await
+}
+
+/// [`spawn_http_proxy`] answering each request line with `status_for(line)`.
+async fn spawn_http_proxy_with(
+    status_for: impl Fn(&str) -> u16 + Send + Sync + 'static,
+) -> (SocketAddr, tokio::sync::mpsc::UnboundedReceiver<String>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let status_for = std::sync::Arc::new(status_for);
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut s, _)) = listener.accept().await else { return };
+            let tx = tx.clone();
+            let status_for = status_for.clone();
+            tokio::spawn(async move {
+                let mut head = Vec::new();
+                while !head.ends_with(b"\r\n\r\n") {
+                    let Ok(b) = s.read_u8().await else { return };
+                    head.push(b);
+                }
+                let line = String::from_utf8_lossy(&head).lines().next().unwrap_or("").to_string();
+                let status = status_for(&line);
+                let _ = tx.send(line);
+                let reply = format!("HTTP/1.1 {status} X\r\nProxy-Agent: fake\r\n\r\n");
+                if s.write_all(reply.as_bytes()).await.is_err() || status != 200 {
+                    return;
+                }
+                let mut buf = [0u8; 4096];
+                while let Ok(n) = s.read(&mut buf).await {
+                    if n == 0 || s.write_all(&buf[..n]).await.is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    (addr, rx)
+}
+
+fn upstream_config(proxy: SocketAddr) -> sox::config::Config {
+    sox::config::Config {
+        upstream: Some(sox::upstream::HttpUpstream::parse(&format!("http://{proxy}")).unwrap()),
+        ..sox::config::Config::default()
+    }
+}
+
+/// SOCKS5 no-auth request: `cmd` for `addr` (ATYP + address + port bytes).
+/// Returns the stream and the reply code.
+async fn socks5_request(proxy: SocketAddr, cmd: u8, addr: &[u8]) -> (TcpStream, u8) {
+    let mut s = TcpStream::connect(proxy).await.unwrap();
+    s.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+    let mut greeting = [0u8; 2];
+    s.read_exact(&mut greeting).await.unwrap();
+    s.write_all(&[&[0x05, cmd, 0x00][..], addr].concat()).await.unwrap();
+    let mut head = [0u8; 4];
+    s.read_exact(&mut head).await.unwrap();
+    let rest = match head[3] {
+        0x04 => 16 + 2,
+        _ => 4 + 2,
+    };
+    s.read_exact(&mut vec![0u8; rest]).await.unwrap();
+    (s, head[1])
+}
+
+/// SOCKS5 CONNECT to a domain; returns the stream and the reply code.
+async fn socks5_connect_domain(proxy: SocketAddr, domain: &str, port: u16) -> (TcpStream, u8) {
+    let addr = [&[0x03, domain.len() as u8][..], domain.as_bytes(), &port.to_be_bytes()].concat();
+    socks5_request(proxy, 0x01, &addr).await
+}
+
+/// The next request line the fake HTTP proxy got, failing instead of hanging.
+async fn next_request(requests: &mut tokio::sync::mpsc::UnboundedReceiver<String>, wait: Duration) -> String {
+    tokio::time::timeout(wait, requests.recv())
+        .await
+        .expect("the upstream never got a request")
+        .unwrap()
+}
+
+/// The domain is forwarded unresolved — the upstream (Burp) must see the
+/// real hostname — and the tunnel carries data both ways.
+#[tokio::test]
+async fn upstream_connect_forwards_hostname_and_relays() {
+    let (http_proxy, mut requests) = spawn_http_proxy(200).await;
+    let (proxy, cancel) = spawn_standalone(upstream_config(http_proxy)).await;
+
+    let (mut s, code) = socks5_connect_domain(proxy, "app.example.invalid", 443).await;
+    assert_eq!(code, 0x00);
+    let line = next_request(&mut requests, Duration::from_secs(5)).await;
+    assert_eq!(line, "CONNECT app.example.invalid:443 HTTP/1.1");
+
+    s.write_all(b"through-burp").await.unwrap();
+    assert_eq!(read_echo(&mut s, 12).await, b"through-burp");
+    cancel.cancel();
+}
+
+#[tokio::test]
+async fn upstream_refusal_fails_the_socks_request() {
+    let (http_proxy, _requests) = spawn_http_proxy(403).await;
+    let (proxy, cancel) = spawn_standalone(upstream_config(http_proxy)).await;
+
+    let (_s, code) = socks5_connect_domain(proxy, "blocked.example.invalid", 443).await;
+    assert_ne!(code, 0x00, "a 403 from the upstream must not look like success");
+    cancel.cancel();
+}
+
+#[tokio::test]
+async fn upstream_rejects_udp_unless_direct() {
+    let (http_proxy, _requests) = spawn_http_proxy(200).await;
+    let udp_echo = spawn_udp_echo().await;
+
+    let (proxy, cancel) = spawn_standalone(upstream_config(http_proxy)).await;
+    let (_s, code) = socks5_request(proxy, 0x03, &[0x01, 0, 0, 0, 0, 0, 0]).await;
+    assert_eq!(code, 0x07, "UDP must be refused as unsupported by default");
+    cancel.cancel();
+
+    let direct = sox::config::Config {
+        upstream_udp: sox::upstream::UpstreamUdp::Direct,
+        ..upstream_config(http_proxy)
+    };
+    let (proxy, cancel) = spawn_standalone(direct).await;
+    let echoed = udp_associate_echo(proxy, udp_echo, b"direct-udp").await;
+    assert!(echoed.is_some_and(|r| r.ends_with(b"direct-udp")));
+    cancel.cancel();
+}
+
+/// SOCKS5 CONNECT to an IPv4 address — what a VPN-based capture app
+/// (PCAPdroid) sends; returns the stream and the reply code.
+async fn socks5_connect_ipv4(proxy: SocketAddr, ip: [u8; 4], port: u16) -> (TcpStream, u8) {
+    socks5_request(proxy, 0x01, &[&[0x01][..], &ip, &port.to_be_bytes()].concat()).await
+}
+
+/// A TLS 1.3-style ClientHello record whose only extension is SNI `host`.
+fn client_hello_with_sni(host: &str) -> Vec<u8> {
+    let name = host.as_bytes();
+    let mut sni = vec![0x00, 0x00];
+    sni.extend_from_slice(&(name.len() as u16 + 5).to_be_bytes());
+    sni.extend_from_slice(&(name.len() as u16 + 3).to_be_bytes());
+    sni.push(0x00);
+    sni.extend_from_slice(&(name.len() as u16).to_be_bytes());
+    sni.extend_from_slice(name);
+
+    let mut hello = vec![0x03, 0x03];
+    hello.extend_from_slice(&[0x5a; 32]);
+    hello.extend_from_slice(&[0x00, 0x00, 0x02, 0x13, 0x01, 0x01, 0x00]);
+    hello.extend_from_slice(&(sni.len() as u16).to_be_bytes());
+    hello.extend_from_slice(&sni);
+
+    let mut record = vec![0x16, 0x03, 0x01];
+    record.extend_from_slice(&(hello.len() as u16 + 4).to_be_bytes());
+    record.push(0x01);
+    record.extend_from_slice(&(hello.len() as u32).to_be_bytes()[1..]);
+    record.extend_from_slice(&hello);
+    record
+}
+
+async fn read_echo(s: &mut TcpStream, len: usize) -> Vec<u8> {
+    let mut buf = vec![0u8; len];
+    tokio::time::timeout(Duration::from_secs(5), s.read_exact(&mut buf))
+        .await
+        .expect("echo timed out")
+        .unwrap();
+    buf
+}
+
+/// `upstream_sni`: an IP-only CONNECT reaches the upstream by the SNI host
+/// name, and the ClientHello read to learn it still reaches the target —
+/// even when the client sends it in two segments.
+#[tokio::test]
+async fn upstream_sni_names_ip_connect_by_client_hello() {
+    let (http_proxy, mut requests) = spawn_http_proxy(200).await;
+    let config = sox::config::Config { upstream_sni: true, ..upstream_config(http_proxy) };
+    let (proxy, cancel) = spawn_standalone(config).await;
+
+    let (mut s, code) = socks5_connect_ipv4(proxy, [192, 0, 2, 7], 443).await;
+    assert_eq!(code, 0x00);
+    let hello = client_hello_with_sni("app.example.invalid");
+    let (first, second) = hello.split_at(7);
+    s.write_all(first).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    s.write_all(second).await.unwrap();
+
+    let line = next_request(&mut requests, Duration::from_secs(5)).await;
+    assert_eq!(line, "CONNECT app.example.invalid:443 HTTP/1.1");
+    assert_eq!(read_echo(&mut s, hello.len()).await, hello);
+    cancel.cancel();
+}
+
+/// The upstream cannot reach the SNI name (502): the IP the client asked
+/// for is CONNECTed instead, and the ClientHello still arrives.
+#[tokio::test]
+async fn upstream_sni_falls_back_to_ip_when_the_name_is_unreachable() {
+    let (http_proxy, mut requests) =
+        spawn_http_proxy_with(|line| if line.contains("app.example.invalid") { 502 } else { 200 }).await;
+    let config = sox::config::Config { upstream_sni: true, ..upstream_config(http_proxy) };
+    let (proxy, cancel) = spawn_standalone(config).await;
+
+    let (mut s, code) = socks5_connect_ipv4(proxy, [192, 0, 2, 7], 443).await;
+    assert_eq!(code, 0x00);
+    let hello = client_hello_with_sni("app.example.invalid");
+    s.write_all(&hello).await.unwrap();
+
+    for expected in ["CONNECT app.example.invalid:443 HTTP/1.1", "CONNECT 192.0.2.7:443 HTTP/1.1"] {
+        assert_eq!(next_request(&mut requests, Duration::from_secs(5)).await, expected);
+    }
+    assert_eq!(read_echo(&mut s, hello.len()).await, hello);
+    cancel.cancel();
+}
+
+/// Not TLS: the IP is CONNECTed as before, at once, with the bytes intact.
+#[tokio::test]
+async fn upstream_sni_falls_back_to_ip_without_tls() {
+    let (http_proxy, mut requests) = spawn_http_proxy(200).await;
+    let config = sox::config::Config { upstream_sni: true, ..upstream_config(http_proxy) };
+    let (proxy, cancel) = spawn_standalone(config).await;
+
+    let (mut s, code) = socks5_connect_ipv4(proxy, [192, 0, 2, 7], 80).await;
+    assert_eq!(code, 0x00);
+    s.write_all(b"GET / HTTP/1.1\r\n\r\n").await.unwrap();
+
+    // Well under SNI_WAIT: non-TLS must not wait for a ClientHello.
+    let line = next_request(&mut requests, Duration::from_secs(1)).await;
+    assert_eq!(line, "CONNECT 192.0.2.7:80 HTTP/1.1");
+    assert_eq!(read_echo(&mut s, 18).await, b"GET / HTTP/1.1\r\n\r\n");
+    cancel.cancel();
+}
+
+// ───────────────────────── SOCKS4 ─────────────────────────
+
+/// SOCKS4 CONNECT (no user id) to an IPv4 `target`; returns the stream and
+/// the reply code.
+async fn socks4_connect(proxy: SocketAddr, target: SocketAddr) -> (TcpStream, u8) {
+    let SocketAddr::V4(target) = target else { panic!("SOCKS4 needs IPv4") };
+    let mut s = TcpStream::connect(proxy).await.unwrap();
+    let mut req = vec![0x04, 0x01];
+    req.extend_from_slice(&target.port().to_be_bytes());
+    req.extend_from_slice(&target.ip().octets());
+    req.push(0x00);
+    s.write_all(&req).await.unwrap();
+    let mut reply = [0u8; 8];
+    s.read_exact(&mut reply).await.unwrap();
+    (s, reply[1])
+}
+
+/// SOCKS4 has no password, so it must not bypass configured credentials.
+#[tokio::test]
+async fn socks4_is_refused_when_auth_is_required() {
+    let echo = spawn_tcp_echo().await;
+    let (socks_port, _) = two_free_ports().await;
+    let proxy: SocketAddr = format!("127.0.0.1:{socks_port}").parse().unwrap();
+    let cancel = CancellationToken::new();
+    start_standalone_with_auth(socks_port, "alice", "secret", cancel.clone());
+    wait_for_listener(proxy).await;
+
+    let (_s, code) = socks4_connect(proxy, echo).await;
+    assert_eq!(code, 0x5b);
+    cancel.cancel();
+}
+
+/// Tunnel mode routes SOCKS4 through a tunnel client like SOCKS5 — never a
+/// dial from the server host itself.
+#[tokio::test]
+async fn socks4_connect_goes_through_the_tunnel() {
+    let echo = spawn_tcp_echo().await;
+    let (socks_port, tunnel_port) = two_free_ports().await;
+    let proxy: SocketAddr = format!("127.0.0.1:{socks_port}").parse().unwrap();
+    let cancel = CancellationToken::new();
+    start_server(socks_port, tunnel_port, cancel.clone());
+    wait_for_listener(proxy).await;
+
+    let (_s, code) = socks4_connect(proxy, echo).await;
+    assert_eq!(code, 0x5b, "no tunnel client: the server must not dial the target itself");
+
+    start_client(tunnel_port, 1, 64, 16, cancel.clone());
+    drop(retry_connect(proxy, echo).await); // wait for the client to register
+    let (mut s, code) = socks4_connect(proxy, echo).await;
+    assert_eq!(code, 0x5a);
+    s.write_all(b"via-tunnel").await.unwrap();
+    let mut got = [0u8; 10];
+    s.read_exact(&mut got).await.unwrap();
+    assert_eq!(&got, b"via-tunnel");
+    cancel.cancel();
+}

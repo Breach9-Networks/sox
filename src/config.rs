@@ -4,6 +4,8 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
+use crate::upstream::{HttpUpstream, UpstreamUdp};
+
 /// Authentication configuration.
 #[derive(Debug, Clone)]
 pub enum AuthConfig {
@@ -60,6 +62,17 @@ pub struct Config {
 
     /// Tunnel mode: per-session yamux receive window (MiB).
     pub tunnel_recv_window_mb: usize,
+
+    /// Standalone mode: send CONNECTs through this HTTP proxy. None = dial
+    /// targets directly.
+    pub upstream: Option<HttpUpstream>,
+
+    /// Standalone mode: what UDP ASSOCIATE does while `upstream` is set.
+    pub upstream_udp: UpstreamUdp,
+
+    /// Standalone mode, with `upstream`: name an IP-only CONNECT by the SNI
+    /// of the client's ClientHello, so the upstream sees a host name.
+    pub upstream_sni: bool,
 }
 
 impl Default for Config {
@@ -84,6 +97,9 @@ impl Default for Config {
             // zero headroom for yamux per-stream BDP auto-tuning, capping
             // single-stream throughput at ~256 KiB / RTT.
             tunnel_recv_window_mb: 256,
+            upstream: None,
+            upstream_udp: UpstreamUdp::default(),
+            upstream_sni: false,
         }
     }
 }
@@ -115,6 +131,7 @@ pub struct FileConfig {
     pub auth: Option<FileAuthConfig>,
     pub tunnel: Option<FileTunnelConfig>,
     pub keepalive: Option<FileKeepaliveConfig>,
+    pub upstream: Option<FileUpstreamConfig>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -144,6 +161,16 @@ pub struct FileTunnelConfig {
     pub reconnect_interval: Option<u64>,
     /// Reconnect backoff cap, seconds.
     pub reconnect_max: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct FileUpstreamConfig {
+    /// Upstream HTTP proxy, `[http://]host:port`.
+    pub proxy: Option<String>,
+    /// UDP ASSOCIATE while proxying: `reject` or `direct`.
+    pub udp: Option<UpstreamUdp>,
+    /// Name IP-only CONNECTs by the client's TLS SNI.
+    pub sni: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -227,6 +254,18 @@ impl FileConfig {
             }
         }
 
+        if let Some(ref upstream) = self.upstream {
+            if let Some(ref proxy) = upstream.proxy {
+                config.upstream = Some(HttpUpstream::parse(proxy).map_err(|e| format!("config: {e}"))?);
+            }
+            if let Some(v) = upstream.udp {
+                config.upstream_udp = v;
+            }
+            if let Some(v) = upstream.sni {
+                config.upstream_sni = v;
+            }
+        }
+
         // Server-side tunnel yamux settings.
         if let Some(ref tunnel) = self.tunnel {
             if let Some(v) = tunnel.max_streams_per_session {
@@ -258,5 +297,21 @@ mod tests {
 
         let bad: FileConfig = toml::from_str("listen = \"not-an-address\"\n").unwrap();
         assert!(bad.apply_to(&mut Config::default()).is_err());
+    }
+
+    #[test]
+    fn upstream_section_applies_and_bad_proxy_is_an_error() {
+        let fc: FileConfig =
+            toml::from_str("[upstream]\nproxy = \"http://127.0.0.1:8080\"\nudp = \"direct\"\nsni = true\n")
+                .unwrap();
+        let mut config = Config::default();
+        fc.apply_to(&mut config).unwrap();
+        assert_eq!(config.upstream, Some(HttpUpstream::parse("127.0.0.1:8080").unwrap()));
+        assert_eq!(config.upstream_udp, UpstreamUdp::Direct);
+        assert!(config.upstream_sni);
+
+        let bad: FileConfig = toml::from_str("[upstream]\nproxy = \"https://x:1\"\n").unwrap();
+        assert!(bad.apply_to(&mut Config::default()).is_err());
+        assert!(toml::from_str::<FileConfig>("[upstream]\nudp = \"maybe\"\n").is_err());
     }
 }

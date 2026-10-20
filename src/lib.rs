@@ -8,3 +8,4 @@ pub mod relay;
 pub mod server;
 pub mod signal;
 pub mod tunnel;
+pub mod upstream;

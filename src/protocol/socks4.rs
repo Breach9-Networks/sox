@@ -88,7 +88,7 @@ pub fn parse_socks4_request(buf: &[u8]) -> Result<(Socks4Request, usize), Protoc
             return Err(ProtocolError::EmptyDomain);
         }
 
-        TargetAddr::Domain(domain, port)
+        TargetAddr::from_host(domain, port)
     } else {
         TargetAddr::Ip(SocketAddr::V4(SocketAddrV4::new(ip, port)))
     };
