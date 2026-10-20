@@ -9,6 +9,10 @@ use sox::client::{ClientConfig, run_client};
 use sox::config::{AuthConfig, Config, FileConfig};
 use sox::server;
 use sox::signal;
+use sox::upstream::{HttpUpstream, UpstreamUdp};
+
+const UPSTREAM_STANDALONE_ONLY: &str =
+    "[upstream] is standalone-only; tunnel mode does not support an upstream proxy";
 
 #[derive(Parser)]
 #[command(
@@ -62,6 +66,22 @@ enum Commands {
         /// Enable monitor dashboard on this address (e.g. 0.0.0.0:8080)
         #[arg(short, long)]
         monitor: Option<SocketAddr>,
+
+        /// Send CONNECTs through an upstream HTTP proxy, e.g. http://127.0.0.1:8080 (Burp)
+        #[arg(long)]
+        upstream: Option<String>,
+
+        /// UDP ASSOCIATE while --upstream is set: reject (keep every flow on
+        /// the proxy) or direct (bypass it) [default: reject]
+        #[arg(long)]
+        upstream_udp: Option<UpstreamUdp>,
+
+        /// With --upstream: CONNECT an IP-only target by the host name in the
+        /// client's TLS SNI, so e.g. Burp can match scope and mint the right
+        /// certificate (for VPN-based capture apps such as PCAPdroid);
+        /// --upstream-sni=false overrides `sni = true` in the config
+        #[arg(long, num_args = 0..=1, default_missing_value = "true", require_equals = true)]
+        upstream_sni: Option<bool>,
 
         /// Log level (trace, debug, info, warn, error)
         #[arg(short, long, default_value = "info")]
@@ -207,6 +227,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             idle_timeout,
             users,
             monitor,
+            upstream,
+            upstream_udp,
+            upstream_sni,
             verbosity,
         } => {
             init_tracing(&verbosity);
@@ -241,6 +264,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 config.auth = auth;
             }
             config.monitor_addr = monitor;
+            if let Some(v) = upstream {
+                config.upstream = Some(HttpUpstream::parse(&v)?);
+            }
+            if let Some(v) = upstream_udp {
+                config.upstream_udp = v;
+            }
+            if let Some(v) = upstream_sni {
+                config.upstream_sni = v;
+            }
+            if config.upstream_sni && config.upstream.is_none() {
+                return Err("--upstream-sni needs an upstream proxy (--upstream or [upstream] proxy)".into());
+            }
 
             let shutdown = CancellationToken::new();
             tokio::spawn(signal::shutdown_signal(shutdown.clone()));
@@ -267,6 +302,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let file_config = load_file_config(&config_path)?;
             if let Some(ref fc) = file_config {
                 fc.apply_to(&mut config)?;
+            }
+            if config.upstream.is_some() {
+                return Err(UPSTREAM_STANDALONE_ONLY.into());
             }
             let secret = resolve_secret(secret, file_config.as_ref())?;
             let file_tunnel = file_config.as_ref().and_then(|fc| fc.tunnel.as_ref());
@@ -312,6 +350,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut base = Config::default();
             if let Some(ref fc) = file_config {
                 fc.apply_to(&mut base)?;
+            }
+            // Ignoring it would silently send tunneled traffic around the proxy.
+            if base.upstream.is_some() {
+                return Err(UPSTREAM_STANDALONE_ONLY.into());
             }
 
             let server_addr = server_addr

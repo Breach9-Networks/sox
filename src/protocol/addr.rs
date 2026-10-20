@@ -1,5 +1,5 @@
 use std::fmt;
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 
 use crate::error::ProtocolError;
 
@@ -62,7 +62,7 @@ impl TargetAddr {
                     String::from_utf8_lossy(&buf[2..2 + domain_len]).into_owned();
                 let port =
                     u16::from_be_bytes([buf[2 + domain_len], buf[3 + domain_len]]);
-                Ok((TargetAddr::Domain(domain, port), total))
+                Ok((TargetAddr::from_host(domain, port), total))
             }
             ATYP_IPV6 => {
                 // 1 (atyp) + 16 (ipv6) + 2 (port) = 19
@@ -123,6 +123,24 @@ impl TargetAddr {
             TargetAddr::Domain(_, port) => *port,
         }
     }
+
+    /// A host sent as a name. An IP literal becomes `Ip` — Chromium sends
+    /// every host as a domain — so nothing downstream resolves it, or formats
+    /// an IPv6 address without brackets.
+    pub fn from_host(host: String, port: u16) -> Self {
+        match host.parse::<IpAddr>() {
+            Ok(ip) => TargetAddr::Ip(SocketAddr::new(ip, port)),
+            Err(_) => TargetAddr::Domain(host, port),
+        }
+    }
+}
+
+/// Whether `name` is something a DNS name can contain (`_` included, as in
+/// service names), 1–255 bytes. Anything else — CR/LF, spaces, `:` or `@` —
+/// must never reach an HTTP request line.
+pub fn is_valid_hostname(name: &[u8]) -> bool {
+    (1..=255).contains(&name.len())
+        && name.iter().all(|&b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_'))
 }
 
 impl fmt::Display for TargetAddr {
@@ -137,6 +155,25 @@ impl fmt::Display for TargetAddr {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ip_literal_hosts_become_ip() {
+        let v6 = TargetAddr::from_host("2001:db8::1".into(), 443);
+        assert_eq!(v6, TargetAddr::Ip("[2001:db8::1]:443".parse().unwrap()));
+        assert_eq!(v6.to_string(), "[2001:db8::1]:443");
+        assert_eq!(
+            TargetAddr::from_host("example.com".into(), 443),
+            TargetAddr::Domain("example.com".into(), 443)
+        );
+    }
+
+    #[test]
+    fn hostname_charset() {
+        assert!(is_valid_hostname(b"my_svc.corp-1.example"));
+        for bad in [&b"a.com\r\nX: 1"[..], b"a.com:443", b"u@h", b"a b", b"", &[b'a'; 256]] {
+            assert!(!is_valid_hostname(bad), "{bad:?}");
+        }
+    }
 
     #[test]
     fn test_parse_ipv4() {

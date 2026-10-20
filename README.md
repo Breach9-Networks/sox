@@ -21,7 +21,7 @@ A high-performance, cross-platform SOCKS proxy server with reverse tunnel suppor
 - **Security hardened** - BLAKE2s PSK derivation, constant-time auth, Noise encryption, length-capped wire decoding
 - **TOML configuration** - CLI > file > defaults, same precedence in every mode
 - **Cross-platform** - Linux (static musl), macOS (ARM), Windows (x64); tests run on all three in CI
-- **Lightweight** - ~1.7MB release binary, written in Rust, 103 tests
+- **Lightweight** - ~1.7MB release binary, written in Rust, 127 tests
 
 ## Architecture
 
@@ -61,9 +61,9 @@ cargo build --release
 # Cross-compile for all platforms
 ./build-cross.sh
 # Output in dist/:
-#   sox-v0.1.0-macos-arm64
-#   sox-v0.1.0-windows-amd64.exe
-#   sox-v0.1.0-linux-amd64       (static musl)
+#   sox-v0.2.0-macos-arm64
+#   sox-v0.2.0-windows-amd64.exe
+#   sox-v0.2.0-linux-amd64       (static musl)
 ```
 
 The release profile is `opt-level = "z"` for the binary as a whole and `3` for the
@@ -101,6 +101,34 @@ curl --proxy socks5://alice:secret@127.0.0.1:1080 https://example.com
 curl --proxy socks4a://127.0.0.1:1080 http://example.com
 ```
 
+### Chaining to an HTTP Proxy (Burp)
+
+For a client that only speaks SOCKS — e.g. an Android phone via PCAPdroid's SOCKS5
+option — standalone mode can forward every CONNECT through an upstream HTTP proxy:
+
+```bash
+sox standalone -l 0.0.0.0:1080 -u zet:secret --upstream http://127.0.0.1:8080
+```
+
+SOCKS5 CONNECTs (and SOCKS4/4a ones when no `-u` is set) become HTTP
+`CONNECT host:port` requests; a domain is passed through unresolved so the upstream
+sees the real hostname. UDP cannot ride an HTTP
+`CONNECT`, so UDP ASSOCIATE is refused by default — QUIC clients then fall back to TCP
+and every flow stays on the proxy. `--upstream-udp direct` relays UDP directly instead,
+bypassing the upstream. Upstream credentials and `https://` proxies are not supported;
+tunnel mode refuses an upstream setting. When the proxy itself fails (unreachable, or
+answers 401/405/407/501) sox warns once, and logs again when it answers.
+
+A VPN-based capture app only knows the destination IP, so the upstream would see
+`CONNECT 203.0.113.5:443` — Burp then cannot match a host-based scope or mint a
+certificate for the right name. `--upstream-sni` fixes that: for an IP-only CONNECT,
+sox replies success first, reads the client's TLS ClientHello, and sends
+`CONNECT <sni>:443` instead (the IP when there is no SNI; non-TLS clients fall back at
+once, server-speaks-first protocols after 2 s). If the upstream cannot reach that name
+(404/410/502/503 — its DNS differs from the client's), sox CONNECTs the IP instead.
+Because the reply precedes the upstream dial, a refused upstream CONNECT shows up as a
+closed connection, not a SOCKS error.
+
 ### SOCKS Protocol Variants
 
 sox supports multiple SOCKS protocol variants. When using tools like `curl`, the proxy URL scheme determines which protocol and DNS behavior is used:
@@ -109,8 +137,8 @@ sox supports multiple SOCKS protocol variants. When using tools like `curl`, the
 |--------|----------|---------------|-------------|
 | `socks5h://` | SOCKS5 | **Server-side** | Client sends the domain name to the proxy. The proxy resolves DNS and connects. Best for privacy and tunnel mode — the target hostname never leaks on the client's network. |
 | `socks5://` | SOCKS5 | **Client-side** | Client resolves DNS locally first, then sends the IP address to the proxy. The proxy only sees an IP, not the hostname. Useful when the client has access to a specific DNS server. |
-| `socks4a://` | SOCKS4a | **Server-side** | Legacy protocol with server-side DNS. Like `socks5h` but without IPv6 or authentication support. |
-| `socks4://` | SOCKS4 | **Client-side** | Original SOCKS4 protocol. Client resolves DNS locally and sends the IP. IPv4 only, no auth. |
+| `socks4a://` | SOCKS4a | **Server-side** | Legacy protocol with server-side DNS. Like `socks5h` but without IPv6 or authentication support — refused when the proxy requires a password. |
+| `socks4://` | SOCKS4 | **Client-side** | Original SOCKS4 protocol. Client resolves DNS locally and sends the IP. IPv4 only, no auth — refused when the proxy requires a password. |
 
 **Which to use?**
 
@@ -226,6 +254,9 @@ sox standalone [OPTIONS]
       --max-per-ip <N>          Max connections per IP [default: 100]
       --idle-timeout <SECS>     Relay idle timeout [default: 300]
       --monitor <ADDR>          Enable monitor dashboard [e.g. 0.0.0.0:8080]
+      --upstream <URL>          Send CONNECTs via an HTTP proxy [e.g. http://127.0.0.1:8080]
+      --upstream-udp <MODE>     UDP while --upstream is set: reject | direct [default: reject]
+      --upstream-sni[=<BOOL>]   Name IP-only CONNECTs by the client's TLS SNI
   -v, --verbosity <LEVEL>       Log level [default: info]
 
 sox server [OPTIONS]
@@ -283,6 +314,11 @@ recv_window_mb = 256                # per-session yamux receive window (MiB); ke
                                     # max_streams_per_session × 0.25 or single-stream throughput caps
 reconnect_interval = 5              # reconnect backoff base (seconds)
 reconnect_max = 60                  # reconnect backoff cap (seconds)
+
+# [upstream]                        # standalone only; server/client refuse it
+# proxy = "http://127.0.0.1:8080"   # forward CONNECTs through this HTTP proxy
+# udp = "reject"                    # UDP ASSOCIATE: reject | direct
+# sni = false                       # name IP-only CONNECTs by the client's TLS SNI
 ```
 
 Config priority: CLI args > TOML file > defaults, in all three modes. The client also

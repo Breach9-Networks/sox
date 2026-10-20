@@ -1,5 +1,6 @@
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
@@ -19,12 +20,14 @@ use crate::protocol::socks5::handshake::{
 };
 use crate::protocol::socks5::reply::write_command_reply;
 use crate::protocol::socks5::{AuthMethod, ReplyCode, Socks5Command};
+use crate::protocol::tls::{client_hello_server_name, read_client_hello};
 use crate::relay::tcp::{relay_bidirectional, relay_tcp_live};
 use crate::relay::udp::{relay_udp, relay_udp_tunneled};
 use crate::server::ServerContext;
 use crate::server::extended_metrics::UserSessionGuard;
 use crate::tunnel::protocol::{StreamOpen, StreamReply};
 use crate::tunnel::router::{Router, TunnelStream};
+use crate::upstream::{HttpUpstream, UpstreamUdp};
 
 /// Longest NUL-terminated field (user id, SOCKS4a domain) accepted in a
 /// SOCKS4 request.
@@ -71,11 +74,11 @@ pub async fn handle_connection(
             );
             match request.command {
                 Socks5Command::Connect => {
-                    handle_connect(stream, peer_addr, &request.target, ctx).await
+                    handle_connect(stream, peer_addr, &request.target, ctx, Dialect::V5).await
                 }
                 Socks5Command::UdpAssociate => handle_udp_associate(stream, peer_addr, ctx).await,
                 Socks5Command::Bind => {
-                    reply_socks5_failure(stream, ReplyCode::CommandNotSupported).await;
+                    Dialect::V5.fail(stream, ReplyCode::CommandNotSupported).await;
                     Err(ServerError::CommandNotSupported)
                 }
             }
@@ -90,12 +93,10 @@ pub async fn handle_connection(
             );
             match request.command {
                 Socks4Command::Connect => {
-                    handle_socks4_connect(stream, peer_addr, &request.target, ctx).await
+                    handle_connect(stream, peer_addr, &request.target, ctx, Dialect::V4).await
                 }
                 Socks4Command::Bind => {
-                    let mut reply = Vec::new();
-                    write_socks4_reply(Socks4Reply::Rejected, None, &mut reply);
-                    stream.write_all(&reply).await?;
+                    Dialect::V4.fail(stream, ReplyCode::CommandNotSupported).await;
                     Err(ServerError::CommandNotSupported)
                 }
             }
@@ -117,7 +118,18 @@ async fn negotiate<'a>(
     let version = stream.read_u8().await?;
     match detect_version(version) {
         Some(SocksVersion::V5) => negotiate_socks5(stream, peer_addr, ctx, version).await,
-        Some(SocksVersion::V4) => Ok(Negotiated::V4(read_socks4_request(stream).await?)),
+        Some(SocksVersion::V4) => {
+            let request = read_socks4_request(stream).await?;
+            // SOCKS4 carries no password: with credentials configured, serving
+            // it would bypass them.
+            if ctx.auth.is_some() {
+                tracing::debug!(%peer_addr, "SOCKS4 refused: authentication is required");
+                bump(&ctx.extended_metrics.errors_auth_rejected);
+                Dialect::V4.fail(stream, ReplyCode::ConnectionNotAllowed).await;
+                return Err(ServerError::Protocol(ProtocolError::NoAcceptableMethod));
+            }
+            Ok(Negotiated::V4(request))
+        }
         None => Err(ServerError::Protocol(ProtocolError::InvalidVersion(version))),
     }
 }
@@ -216,38 +228,27 @@ async fn read_socks4_request(stream: &mut TcpStream) -> Result<Socks4Request, Se
 }
 
 /// Append bytes from `stream` to `out` up to and including the next NUL —
-/// and not one byte further. `peek` shows what has arrived; exactly the part
-/// up to the terminator is then consumed, so this costs two syscalls per TCP
-/// segment rather than one per byte.
+/// and not one byte further.
 async fn read_through_nul(stream: &mut TcpStream, out: &mut Vec<u8>) -> std::io::Result<()> {
-    let mut window = [0u8; SOCKS4_MAX_FIELD + 1];
-    let mut field_len = 0;
-    loop {
-        let room = SOCKS4_MAX_FIELD + 1 - field_len;
-        if room == 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "SOCKS4 field too long",
-            ));
-        }
-        let peeked = stream.peek(&mut window[..room]).await?;
-        if peeked == 0 {
-            return Err(std::io::ErrorKind::UnexpectedEof.into());
-        }
-        let nul = window[..peeked].iter().position(|&b| b == 0);
-        let take = nul.map_or(peeked, |i| i + 1);
-        stream.read_exact(&mut window[..take]).await?;
-        out.extend_from_slice(&window[..take]);
-        field_len += take;
-        if nul.is_some() {
-            return Ok(());
-        }
-    }
+    net::read_field(stream, out, SOCKS4_MAX_FIELD + 1, |field| {
+        field.iter().position(|&b| b == 0).map(|i| i + 1)
+    })
+    .await
 }
 
-/// Resolve and dial a CONNECT target (standalone mode), with keepalive set.
+/// Resolve and dial a CONNECT target (standalone mode), with keepalive set —
+/// or tunnel to it through the upstream HTTP proxy when one is configured.
 async fn dial(target: &TargetAddr, ctx: &ServerContext) -> Result<TcpStream, ServerError> {
     let config = &ctx.config;
+    if let Some(upstream) = &config.upstream {
+        let result = upstream.connect(target, config).await;
+        if let Err(e) = &result {
+            bump(&ctx.extended_metrics.errors_connection_failed);
+            tracing::debug!(%target, %upstream, error = %e, "upstream CONNECT failed");
+        }
+        log_upstream_health(upstream, &result);
+        return result;
+    }
     let addrs = match resolve_target(target, config).await {
         Ok(addrs) => addrs,
         Err(e) => {
@@ -268,6 +269,48 @@ async fn dial(target: &TargetAddr, ctx: &ServerContext) -> Result<TcpStream, Ser
                 ServerError::Io(e)
             })
         }
+    }
+}
+
+/// Something that is logged once when it goes down and once when it comes
+/// back, not once per request.
+struct TransitionLog(AtomicBool);
+
+impl TransitionLog {
+    const fn new() -> Self {
+        Self(AtomicBool::new(false))
+    }
+
+    /// Whether this call took it down. Loads first: the common case is "no
+    /// change", and a load does not bounce the cache line between cores.
+    fn went_down(&self) -> bool {
+        !self.0.load(Ordering::Relaxed) && !self.0.swap(true, Ordering::Relaxed)
+    }
+
+    /// Whether this call brought it back.
+    fn came_back(&self) -> bool {
+        self.0.load(Ordering::Relaxed) && self.0.swap(false, Ordering::Relaxed)
+    }
+}
+
+static UPSTREAM_DOWN: TransitionLog = TransitionLog::new();
+
+/// Warn once when CONNECTs start failing because of the proxy itself — that
+/// fails every connection — and note when it answers again. Target-side
+/// failures (timeouts, unreachable) say nothing about the proxy.
+fn log_upstream_health(upstream: &HttpUpstream, result: &Result<TcpStream, ServerError>) {
+    match result {
+        Err(e) if e.is_upstream_fault() => {
+            if UPSTREAM_DOWN.went_down() {
+                tracing::warn!(%upstream, error = %e, "upstream proxy failing (suppressing further warnings)");
+            }
+        }
+        Ok(_) | Err(ServerError::UpstreamRejected(_)) => {
+            if UPSTREAM_DOWN.came_back() {
+                tracing::info!(%upstream, "upstream proxy answering again");
+            }
+        }
+        Err(_) => {}
     }
 }
 
@@ -302,75 +345,126 @@ async fn relay_direct(
     Ok(())
 }
 
-/// Handle SOCKS4 CONNECT.
-async fn handle_socks4_connect(
+/// Which SOCKS version's reply a CONNECT client is waiting for.
+#[derive(Clone, Copy)]
+enum Dialect {
+    V4,
+    V5,
+}
+
+impl Dialect {
+    /// The success reply, naming `bind` where the version can express it.
+    fn success(self, bind: Option<SocketAddr>) -> Vec<u8> {
+        let mut out = Vec::new();
+        match self {
+            Dialect::V4 => {
+                let bind = match bind {
+                    Some(SocketAddr::V4(v4)) => Some(v4),
+                    _ => None,
+                };
+                write_socks4_reply(Socks4Reply::Granted, bind, &mut out);
+            }
+            Dialect::V5 => {
+                let bind = bind.map_or_else(TargetAddr::unspecified, TargetAddr::Ip);
+                write_command_reply(ReplyCode::Succeeded, &bind, &mut out);
+            }
+        }
+        out
+    }
+
+    /// Fail the client with `code` (SOCKS4 only knows "rejected"), ignoring
+    /// any write error — so it fails fast instead of waiting on a closed socket.
+    async fn fail(self, stream: &mut TcpStream, code: ReplyCode) {
+        let mut out = Vec::new();
+        match self {
+            Dialect::V4 => write_socks4_reply(Socks4Reply::Rejected, None, &mut out),
+            Dialect::V5 => write_command_reply(code, &TargetAddr::unspecified(), &mut out),
+        }
+        let _ = stream.write_all(&out).await;
+    }
+}
+
+/// Whether this CONNECT goes through [`connect_named_by_sni`]: an upstream
+/// proxy with `upstream_sni`, and a target that is only an IP — which an
+/// intercepting upstream cannot match against a host-based scope or mint a
+/// certificate for.
+fn names_by_sni(target: &TargetAddr, config: &Config) -> bool {
+    config.upstream_sni && config.upstream.is_some() && matches!(target, TargetAddr::Ip(_))
+}
+
+/// How long an IP-only CONNECT waits for the client's ClientHello under
+/// `upstream_sni`. Server-speaks-first protocols (SSH, SMTP) send nothing
+/// until greeted, so each such connection pays this before the IP is used.
+const SNI_WAIT: Duration = Duration::from_secs(2);
+
+/// CONNECT through the upstream by the host name in the client's SNI.
+///
+/// The SNI only arrives after the SOCKS handshake, so the client is told
+/// "success" before the upstream is dialed. The cost: a failed upstream
+/// CONNECT can no longer be a SOCKS error reply — the client sees the
+/// connection close. Without a usable SNI the IP is CONNECTed as before.
+async fn connect_named_by_sni(
     stream: &mut TcpStream,
     peer_addr: SocketAddr,
     target: &TargetAddr,
     ctx: &ServerContext,
+    dialect: Dialect,
 ) -> Result<(), ServerError> {
-    let mut target_stream = match dial(target, ctx).await {
-        Ok(s) => s,
-        Err(e) => {
-            let mut reply = Vec::new();
-            write_socks4_reply(Socks4Reply::Rejected, None, &mut reply);
-            let _ = stream.write_all(&reply).await;
-            return Err(e);
+    stream.write_all(&dialect.success(None)).await?;
+    let hello = read_client_hello(stream, SNI_WAIT).await?;
+    let named = client_hello_server_name(&hello).map(|host| TargetAddr::Domain(host, target.port()));
+    let upstream_target = named.as_ref().unwrap_or(target);
+    tracing::debug!(%peer_addr, %target, via = %upstream_target, "CONNECT named by SNI");
+
+    let mut target_stream = match dial(upstream_target, ctx).await {
+        // The proxy could not reach the name (its DNS differs from the
+        // client's, a pinned or split-horizon address). Nothing has been
+        // sent yet, so the address the client actually asked for still can.
+        Err(e @ ServerError::UpstreamRejected(_))
+            if named.is_some() && e.to_reply_code() == ReplyCode::HostUnreachable =>
+        {
+            tracing::debug!(%peer_addr, %target, "upstream cannot reach the SNI name, using the IP");
+            dial(target, ctx).await?
         }
+        result => result?,
     };
-
-    // SOCKS4 reply with bound address
-    let bind_v4 = target_stream
-        .local_addr()
-        .ok()
-        .and_then(|a| match a {
-            SocketAddr::V4(v4) => Some(v4),
-            SocketAddr::V6(_) => None,
-        })
-        .unwrap_or_else(|| SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0));
-
-    let mut reply = Vec::new();
-    write_socks4_reply(Socks4Reply::Granted, Some(bind_v4), &mut reply);
-    stream.write_all(&reply).await?;
-
-    tracing::debug!(%peer_addr, %target, "SOCKS4 CONNECT established, starting relay");
-    relay_direct(stream, &mut target_stream, peer_addr, target, ctx).await
+    target_stream.write_all(&hello).await?;
+    ctx.metrics
+        .bytes_client_to_target
+        .fetch_add(hello.len() as u64, Ordering::Relaxed);
+    drop(hello);
+    relay_direct(stream, &mut target_stream, peer_addr, upstream_target, ctx).await
 }
 
-/// Handle SOCKS5 CONNECT command.
-/// In standalone mode: connects directly. In tunnel mode: routes through a tunnel client.
+/// Handle a SOCKS4 or SOCKS5 CONNECT: through a tunnel client in tunnel mode,
+/// otherwise dialed from here — directly or via the upstream proxy.
 async fn handle_connect(
     stream: &mut TcpStream,
     peer_addr: SocketAddr,
     target: &TargetAddr,
     ctx: &ServerContext,
+    dialect: Dialect,
 ) -> Result<(), ServerError> {
-    // Tunnel mode: route through a tunnel client
     if let Some(router) = &ctx.router {
-        return handle_connect_via_tunnel(stream, peer_addr, target, ctx, router).await;
+        return handle_connect_via_tunnel(stream, peer_addr, target, ctx, router, dialect).await;
     }
 
-    // Standalone mode: connect directly
+    if names_by_sni(target, &ctx.config) {
+        return connect_named_by_sni(stream, peer_addr, target, ctx, dialect).await;
+    }
+
     let mut target_stream = match dial(target, ctx).await {
         Ok(s) => s,
         Err(e) => {
-            reply_socks5_failure(stream, e.to_reply_code()).await;
+            dialect.fail(stream, e.to_reply_code()).await;
             return Err(e);
         }
     };
 
-    let bind_addr = match target_stream.local_addr() {
-        Ok(addr) => TargetAddr::Ip(addr),
-        Err(_) => TargetAddr::unspecified(),
-    };
-    let mut reply = Vec::new();
-    write_command_reply(ReplyCode::Succeeded, &bind_addr, &mut reply);
-    stream.write_all(&reply).await?;
+    let bind = target_stream.local_addr().ok();
+    stream.write_all(&dialect.success(bind)).await?;
 
-    tracing::debug!(
-        %peer_addr, %target, bind = %bind_addr,
-        "CONNECT established, starting relay"
-    );
+    tracing::debug!(%peer_addr, %target, ?bind, "CONNECT established, starting relay");
     relay_direct(stream, &mut target_stream, peer_addr, target, ctx).await
 }
 
@@ -446,35 +540,34 @@ async fn open_tunnel_flow(
     }))
 }
 
-/// Rate-limit the "no tunnel clients" warning: log once on transition, not per
-/// request.
-static NO_CLIENTS_LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static NO_TUNNEL_CLIENTS: TransitionLog = TransitionLog::new();
 
 fn log_no_tunnel_clients() {
-    if !NO_CLIENTS_LOGGED.swap(true, Ordering::Relaxed) {
+    if NO_TUNNEL_CLIENTS.went_down() {
         tracing::warn!("no tunnel clients available (suppressing further warnings)");
     }
 }
 
 fn log_tunnel_clients_back() {
-    if NO_CLIENTS_LOGGED.swap(false, Ordering::Relaxed) {
+    if NO_TUNNEL_CLIENTS.came_back() {
         tracing::info!("tunnel client available again");
     }
 }
 
 /// Open a tunnel flow for `open` and turn anything but a successful reply
-/// into a SOCKS5 failure reply — the client is still blocked waiting for one.
+/// into a failure reply — the client is still blocked waiting for one.
 async fn open_tunnel_flow_or_reply(
     stream: &mut TcpStream,
     open: &StreamOpen,
     ctx: &ServerContext,
     router: &Router,
+    dialect: Dialect,
 ) -> Result<TunnelFlow, ServerError> {
     let flow = match open_tunnel_flow(router, open, &ctx.config).await {
         Ok(flow) => flow,
         Err((code, e)) => {
             bump(&ctx.extended_metrics.errors_connection_failed);
-            reply_socks5_failure(stream, code).await;
+            dialect.fail(stream, code).await;
             return Err(e);
         }
     };
@@ -482,7 +575,7 @@ async fn open_tunnel_flow_or_reply(
 
     if flow.reply.status != 0 {
         bump(&ctx.extended_metrics.errors_connection_failed);
-        reply_socks5_failure(stream, ReplyCode::from_u8(flow.reply.status)).await;
+        dialect.fail(stream, ReplyCode::from_u8(flow.reply.status)).await;
         return Err(ServerError::Io(std::io::Error::new(
             std::io::ErrorKind::ConnectionRefused,
             flow.reply.message,
@@ -491,23 +584,22 @@ async fn open_tunnel_flow_or_reply(
     Ok(flow)
 }
 
-/// Handle SOCKS5 CONNECT via a tunnel client (yamux multiplexed).
+/// Handle a CONNECT via a tunnel client (yamux multiplexed).
 async fn handle_connect_via_tunnel(
     stream: &mut TcpStream,
     peer_addr: SocketAddr,
     target: &TargetAddr,
     ctx: &ServerContext,
     router: &Router,
+    dialect: Dialect,
 ) -> Result<(), ServerError> {
     tracing::debug!(%peer_addr, %target, "routing CONNECT through tunnel");
 
     let open = StreamOpen::Tcp { target: target.to_string() };
-    let mut flow = open_tunnel_flow_or_reply(stream, &open, ctx, router).await?;
+    let mut flow = open_tunnel_flow_or_reply(stream, &open, ctx, router, dialect).await?;
 
     // Success — reply to the SOCKS client, then relay.
-    let mut buf = Vec::new();
-    write_command_reply(ReplyCode::Succeeded, &TargetAddr::unspecified(), &mut buf);
-    stream.write_all(&buf).await?;
+    stream.write_all(&dialect.success(None)).await?;
 
     tracing::debug!(%peer_addr, %target, "tunnel CONNECT established, starting relay");
 
@@ -532,15 +624,6 @@ async fn handle_connect_via_tunnel(
     Ok(())
 }
 
-/// Send a SOCKS5 command reply carrying `code` to the client, ignoring any
-/// write error. Used on error paths so the client fails fast with a proper
-/// reply code instead of waiting on a silently-closed socket.
-async fn reply_socks5_failure(stream: &mut TcpStream, code: ReplyCode) {
-    let mut buf = Vec::new();
-    write_command_reply(code, &TargetAddr::unspecified(), &mut buf);
-    let _ = stream.write_all(&buf).await;
-}
-
 // ───────────────────────── UDP ASSOCIATE ─────────────────────────
 
 /// Handle SOCKS5 UDP ASSOCIATE command.
@@ -561,6 +644,13 @@ async fn handle_udp_associate(
     peer_addr: SocketAddr,
     ctx: &ServerContext,
 ) -> Result<(), ServerError> {
+    // UDP cannot ride an HTTP CONNECT: unless told to bypass the upstream,
+    // refuse it so every flow stays on the (intercepting) proxy.
+    if ctx.config.upstream.is_some() && ctx.config.upstream_udp == UpstreamUdp::Reject {
+        Dialect::V5.fail(stream, ReplyCode::CommandNotSupported).await;
+        return Err(ServerError::CommandNotSupported);
+    }
+
     // Bind the relay socket on the address the client reached us at: same
     // address family as the client, and a BND.ADDR it can actually send to
     // (0.0.0.0 is not one). A dual-stack listener reports a v4 client's local
@@ -568,7 +658,7 @@ async fn handle_udp_associate(
     let local_ip = stream.local_addr()?.ip().to_canonical();
     let relay_socket = UdpSocket::bind((local_ip, 0)).await?;
     let relay_addr = relay_socket.local_addr()?;
-    let bind_addr = TargetAddr::Ip(relay_addr);
+    let success = Dialect::V5.success(Some(relay_addr));
 
     tracing::debug!(%peer_addr, relay = %relay_addr, "UDP ASSOCIATE relay bound");
 
@@ -576,19 +666,15 @@ async fn handle_udp_associate(
     let outcome = match &ctx.router {
         // Tunnel mode: open the tunnel UDP stream FIRST, then reply.
         Some(router) => {
-            let flow = open_tunnel_flow_or_reply(stream, &StreamOpen::Udp, ctx, router).await?;
-            let mut reply = Vec::new();
-            write_command_reply(ReplyCode::Succeeded, &bind_addr, &mut reply);
-            stream.write_all(&reply).await?;
+            let flow = open_tunnel_flow_or_reply(stream, &StreamOpen::Udp, ctx, router, Dialect::V5).await?;
+            stream.write_all(&success).await?;
             tracing::debug!(%peer_addr, "UDP ASSOCIATE routed through tunnel");
 
             relay_udp_tunneled(stream, relay_socket, peer_addr.ip(), flow.io, idle_timeout).await
         }
         // Standalone mode: relay is local, safe to reply immediately.
         None => {
-            let mut reply = Vec::new();
-            write_command_reply(ReplyCode::Succeeded, &bind_addr, &mut reply);
-            stream.write_all(&reply).await?;
+            stream.write_all(&success).await?;
 
             let dns_timeout = ctx.config.dns_timeout;
             relay_udp(stream, relay_socket, peer_addr.ip(), idle_timeout, dns_timeout).await

@@ -1,10 +1,12 @@
 //! Socket-level helpers shared by the SOCKS server, the tunnel transport and
-//! the tunnel client: keepalive configuration, DNS resolution and dialing.
+//! the tunnel client: keepalive configuration, DNS resolution, dialing and
+//! exact reads of delimited fields.
 
 use std::io;
 use std::net::SocketAddr;
 use std::time::Duration;
 
+use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;
 use tokio::time::Instant;
 
@@ -82,6 +84,41 @@ fn set_keepalive_probes(stream: &TcpStream, count: u32) {
 /// `TcpMaxDataRetransmissions` registry value applies instead.
 #[cfg(not(unix))]
 fn set_keepalive_probes(_stream: &TcpStream, _count: u32) {}
+
+/// Append one delimited field from `stream` to `out` — through its terminator
+/// and not one byte further, since what follows belongs to someone else.
+/// `field_len(field)` is the field's length once its terminator has arrived.
+/// `peek` shows what has arrived and exactly the field is then consumed, so
+/// this costs two syscalls per TCP segment rather than one per byte. A field
+/// longer than `max` is an error.
+pub async fn read_field(
+    stream: &mut TcpStream,
+    out: &mut Vec<u8>,
+    max: usize,
+    field_len: impl Fn(&[u8]) -> Option<usize>,
+) -> io::Result<()> {
+    let start = out.len();
+    let mut window = [0u8; 1024];
+    loop {
+        let room = (start + max - out.len()).min(window.len());
+        if room == 0 {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "field too long"));
+        }
+        let peeked = stream.peek(&mut window[..room]).await?;
+        if peeked == 0 {
+            return Err(io::ErrorKind::UnexpectedEof.into());
+        }
+        let before = out.len();
+        out.extend_from_slice(&window[..peeked]);
+        let end = field_len(&out[start..]).map(|len| start + len);
+        let take = end.map_or(peeked, |end| end - before);
+        stream.read_exact(&mut window[..take]).await?;
+        if let Some(end) = end {
+            out.truncate(end);
+            return Ok(());
+        }
+    }
+}
 
 /// Resolve `host:port` to every address it maps to, bounded by `timeout`.
 pub async fn resolve(host: &str, port: u16, timeout: Duration) -> io::Result<Vec<SocketAddr>> {

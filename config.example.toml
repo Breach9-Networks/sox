@@ -44,3 +44,9 @@ secret = "change-me"              # Shared secret for Noise encryption (server +
                                     #   stream tops out at ~256 KiB / RTT.
 # reconnect_interval = 5            # Reconnect backoff base (seconds)
 # reconnect_max = 60                # Reconnect backoff cap (seconds)
+
+# Upstream HTTP proxy (standalone only; e.g. Burp)
+# [upstream]
+# proxy = "http://127.0.0.1:8080"   # Forward CONNECTs through this HTTP proxy
+# udp = "reject"                    # UDP ASSOCIATE: reject (keep all flows on the proxy) | direct
+# sni = false                       # Name IP-only CONNECTs by the client's TLS SNI (VPN capture apps)
